@@ -88,3 +88,44 @@ jobs:
             exit 1
           fi
           echo "PASS: logs role cannot create tables, as intended"
+
+  cdk-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Sign in with the deploy role
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Can use every CDK helper role (should PASS)
+        run: |
+          ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+          for R in deploy-role file-publishing-role image-publishing-role lookup-role; do
+            aws sts assume-role --role-arn "arn:aws:iam::${ACCOUNT}:role/cdk-hnb659fds-${R}-${ACCOUNT}-${AWS_REGION}" \
+              --role-session-name cdk-check --query 'AssumedRoleUser.Arn' --output text >/dev/null
+            echo "::notice title=CDK helper role::${R} OK"
+          done
+
+      - name: Real CDK run against the account, creating nothing (should PASS)
+        run: |
+          mkdir -p /tmp/cdk-check && cd /tmp/cdk-check
+          npm init -y >/dev/null
+          npm install --silent aws-cdk-lib@2 constructs@10 aws-cdk@2 >/dev/null
+          cat > app.js <<'JS'
+          const cdk = require('aws-cdk-lib');
+          const app = new cdk.App();
+          const stack = new cdk.Stack(app, 'effect-demo-cdk-check', {
+            env: { account: process.env.CDK_DEFAULT_ACCOUNT, region: process.env.CDK_DEFAULT_REGION },
+          });
+          new cdk.CfnOutput(stack, 'Check', { value: 'ok' });
+          JS
+          echo '{ "app": "node app.js" }' > cdk.json
+          # diff assumes the lookup/deploy roles, reads the bootstrap version and compares
+          # against CloudFormation, but deploys nothing.
+          npx cdk diff --fail=false 2>&1 | tee diff.txt
+          if grep -qi "requires bootstrap\|not been bootstrapped\|AccessDenied\|is not authorized" diff.txt; then
+            echo "::error title=CDK::CDK could not use the bootstrap roles; see this step's log"
+            exit 1
+          fi
+          echo "::notice title=CDK diff::CDK ran against the account using the bootstrap roles"
