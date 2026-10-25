@@ -1,0 +1,37 @@
+name: Live check
+
+# Starts a real run against the deployed demo with killed workers and fails if any
+# record is lost or left open. Run by hand from the Actions tab (or push a change to
+# this file / the script). Uses only the public URL, no AWS credentials.
+on:
+  workflow_dispatch:
+    inputs:
+      workers: { description: "Workers", default: "4" }
+      reject_percent: { description: "Reject %", default: "50" }
+      kill_workers: { description: "Workers to kill", default: "2" }
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/live-check.yml"
+      - "scripts/live_check.py"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: live-check
+  cancel-in-progress: false
+
+env:
+  DEMO_URL: https://htd5qtuasvlslvzldh3bsragui0jdkwr.lambda-url.us-west-2.on.aws/
+
+jobs:
+  live:
+    runs-on: ubuntu-latest
+    timeout-minutes: 16
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run with killed workers and verify nothing is lost
+        run: >
+          python3 scripts/live_check.py "$DEMO_URL"
+          "${{ inputs.workers || '4' }}" "${{ inputs.reject_percent || '50' }}" "${{ inputs.kill_workers || '2' }}"
