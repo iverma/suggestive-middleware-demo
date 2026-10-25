@@ -12,22 +12,26 @@ from constructs import Construct
 
 ROOT = Path(__file__).resolve().parents[2]
 CSV = ROOT / "golden_set" / "golden_set_irops_msp.csv"
-LOADER_SRC = ROOT / "infra" / "loader"
-LOADER_BUILD = ROOT / "infra" / ".build" / "loader"
+CONTROL_SRC = ROOT / "infra" / "experiment_control"
+CONTROL_BUILD = ROOT / "infra" / ".build" / "experiment_control"
 
 # Free tier: 25 provisioned RCU + 25 provisioned WCU per account, across ALL tables.
 # Keep this table well under so later tables (queue, ledger) still fit.
 READ_CAPACITY = 10
 WRITE_CAPACITY = 10
+# Loads are paced below the table's write capacity so concurrent workers keep headroom
+# and the load itself never gets throttled. Provisioned capacity is what's billed, so
+# this is about clean experiments, not cost: the table can never exceed 10 WCU.
+LOAD_WCU_PER_SEC = 8
 
 
-def stage_loader():
+def stage_experiment_control():
     """Bundle the handler with the CSV so the Lambda asset is self-contained."""
-    if LOADER_BUILD.exists():
-        shutil.rmtree(LOADER_BUILD)
-    LOADER_BUILD.mkdir(parents=True)
-    shutil.copy(LOADER_SRC / "handler.py", LOADER_BUILD / "handler.py")
-    shutil.copy(CSV, LOADER_BUILD / CSV.name)
+    if CONTROL_BUILD.exists():
+        shutil.rmtree(CONTROL_BUILD)
+    CONTROL_BUILD.mkdir(parents=True)
+    shutil.copy(CONTROL_SRC / "handler.py", CONTROL_BUILD / "handler.py")
+    shutil.copy(CSV, CONTROL_BUILD / CSV.name)
     return hashlib.sha256(CSV.read_bytes()).hexdigest()[:16]
 
 
@@ -49,36 +53,46 @@ class CustomerRecordsStack(Stack):
             removal_policy=RemovalPolicy.DESTROY,             # demo: tearing down leaves nothing billing
         )
 
-        data_hash = stage_loader()
+        data_hash = stage_experiment_control()
 
         log_group = logs.LogGroup(
-            self, "LoaderLogs",
-            log_group_name="/aws/lambda/effect-demo-records-loader",
+            self, "ExperimentControlLogs",
+            log_group_name="/aws/lambda/effect-demo-experiment-control",
             retention=logs.RetentionDays.ONE_WEEK,
             removal_policy=RemovalPolicy.DESTROY,
         )
-        loader = lambda_.Function(
-            self, "Loader",
-            function_name="effect-demo-records-loader",
+        control = lambda_.Function(
+            self, "ExperimentControl",
+            function_name="effect-demo-experiment-control",
+            description="Experiment control: paced golden-set load (more actions later)",
             runtime=lambda_.Runtime.PYTHON_3_12,
             architecture=lambda_.Architecture.ARM_64,
             handler="handler.handler",
-            code=lambda_.Code.from_asset(str(LOADER_BUILD)),
+            code=lambda_.Code.from_asset(str(CONTROL_BUILD)),
             memory_size=256,
-            timeout=Duration.minutes(5),
-            environment={"TABLE_NAME": table.table_name},
+            timeout=Duration.minutes(10),   # 500 rows at 8 WCU/s is ~63s; plenty of room
+            environment={
+                "TABLE_NAME": table.table_name,
+                "TABLE_WCU": str(WRITE_CAPACITY),
+                "DEFAULT_WCU_PER_SEC": str(LOAD_WCU_PER_SEC),
+            },
             log_group=log_group,
         )
-        table.grant_write_data(loader)
+        table.grant_write_data(control)
 
+        # New logical ID: a custom resource can't switch to a different Lambda in place.
         load = CustomResource(
-            self, "GoldenSetLoad",
-            service_token=loader.function_arn,
-            resource_type="Custom::GoldenSetLoad",
-            properties={"DataHash": data_hash},   # CSV change -> reload on next deploy
+            self, "ExperimentGoldenSetLoad",
+            service_token=control.function_arn,
+            resource_type="Custom::ExperimentGoldenSetLoad",
+            properties={"DataHash": data_hash},   # CSV change -> paced reload on next deploy
         )
         load.node.add_dependency(table)
 
         CfnOutput(self, "TableName", value=table.table_name)
+        CfnOutput(self, "ExperimentControlFunction", value=control.function_name)
         CfnOutput(self, "RecordsLoaded", value=load.get_att_string("Loaded"))
+        CfnOutput(self, "LoadWcuConsumed", value=load.get_att_string("WcuConsumed"))
+        CfnOutput(self, "LoadWcuPerSecActual", value=load.get_att_string("WcuPerSecActual"))
+        CfnOutput(self, "LoadSeconds", value=load.get_att_string("Seconds"))
         CfnOutput(self, "GoldenSetHash", value=data_hash)
