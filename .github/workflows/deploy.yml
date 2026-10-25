@@ -61,4 +61,5 @@ jobs:
           import json
           o = json.load(open('outputs.json'))['effect-demo-customer-records']
           print(f\"::notice title=Deployed::{o['TableName']} loaded with {o['RecordsLoaded']} records\")
+          print(f\"::notice title=Paced load::{o['LoadWcuConsumed']} WCU in {o['LoadSeconds']}s = {o['LoadWcuPerSecActual']} WCU/s via {o['ExperimentControlFunction']}\")
           "
