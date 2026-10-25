@@ -1,0 +1,64 @@
+name: Deploy
+
+# Deploys the CDK app in infra/ whenever infra or the golden set changes on main.
+# Can also be run by hand: Actions tab -> "Deploy" -> Run workflow.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "infra/**"
+      - "golden_set/**"
+      - ".github/workflows/deploy.yml"
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+# never run two deploys against the same account at once
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: infra
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install CDK
+        run: |
+          pip install -q -r requirements.txt
+          npm install -g aws-cdk@2 >/dev/null
+
+      - name: Sign in with the deploy role
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Diff
+        run: cdk diff --fail=false
+
+      - name: Deploy
+        run: cdk deploy --all --require-approval never --outputs-file outputs.json
+
+      - name: Report outputs
+        run: |
+          cat outputs.json
+          python3 -c "
+          import json
+          o = json.load(open('outputs.json'))['effect-demo-customer-records']
+          print(f\"::notice title=Deployed::{o['TableName']} loaded with {o['RecordsLoaded']} records\")
+          "
