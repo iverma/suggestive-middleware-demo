@@ -1,6 +1,6 @@
 name: Deploy
 
-# Deploys the CDK app in infra/ whenever infra or the golden set changes on main.
+# Tests, then deploys the CDK app in infra/ whenever infra or the golden set changes on main.
 # Can also be run by hand: Actions tab -> "Deploy" -> Run workflow.
 on:
   push:
@@ -21,7 +21,20 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: End-to-end tests (mocked DynamoDB + SQS, killed workers, zombie fencing)
+        run: |
+          pip install -q boto3 "moto[dynamodb,sqs]" pytest
+          python -m pytest infra/tests -q -p no:warnings
+
   deploy:
+    needs: test
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -60,6 +73,14 @@ jobs:
           python3 -c "
           import json
           o = json.load(open('outputs.json'))['effect-demo-customer-records']
+          print(f\"::notice title=Demo UI::{o['DemoUrl']}\")
           print(f\"::notice title=Deployed::{o['TableName']} loaded with {o['RecordsLoaded']} records\")
           print(f\"::notice title=Paced load::{o['LoadWcuConsumed']} WCU in {o['LoadSeconds']}s = {o['LoadWcuPerSecActual']} WCU/s via {o['ExperimentControlFunction']}\")
+          print(f\"::notice title=Experiment control ARN::{o['ExperimentControlArn']}\")
           "
+
+      - name: Smoke test the public URL
+        run: |
+          URL=$(python3 -c "import json;print(json.load(open('outputs.json'))['effect-demo-customer-records']['DemoUrl'])")
+          curl -fsS "${URL}" | grep -q "re-booking desk"
+          curl -fsS "${URL}results" | python3 -c "import json,sys; r=json.load(sys.stdin); print(f\"::notice title=Smoke test::UI up; /results sees {r['records_in_table']} records\")"

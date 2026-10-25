@@ -4,3 +4,4 @@ __pycache__/
 node_modules/
 infra/cdk.out/
 infra/.build/
+.pytest_cache/

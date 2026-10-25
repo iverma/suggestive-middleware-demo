@@ -1,0 +1,284 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>IROPS re-booking desk</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=Barlow+Condensed:wght@500;600;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #E6ECEF; --panel: #F5F8F9; --ink: #1C2A36; --muted: #5B6B78; --line: #C9D3DA;
+    --queued: #93A3B0; --inflight: #D99A00; --resolved: #2E7A57; --human: #6D4BA8; --bad: #B23B2E;
+    --focus: #1F6FB2;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #16212B; --panel: #1E2B36; --ink: #E3EAEF; --muted: #9AABB8; --line: #31424F;
+            --queued: #5E7182; --inflight: #E6A915; --resolved: #3F9A6F; --human: #8C6BC9; --bad: #D9594A; --focus: #6AAEE8; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+         font: 16px/1.5 "Atkinson Hyperlegible", system-ui, sans-serif; }
+  .wrap { max-width: 1180px; margin: 0 auto; padding: 20px 16px 64px; }
+  h1, h2, .num { font-family: "Barlow Condensed", system-ui, sans-serif; letter-spacing: .01em; }
+  h1 { font-size: 2rem; line-height: 1.1; margin: 0; font-weight: 700; }
+  h2 { font-size: 1.35rem; margin: 0 0 10px; font-weight: 600; }
+  .sub { color: var(--muted); margin: 4px 0 0; max-width: 70ch; }
+  header { display: flex; flex-wrap: wrap; gap: 16px 32px; justify-content: space-between; align-items: end;
+           padding-bottom: 18px; border-bottom: 2px solid var(--ink); }
+  form.controls { display: flex; flex-wrap: wrap; gap: 10px; align-items: end; }
+  label { display: grid; gap: 2px; font-size: .85rem; color: var(--muted); }
+  input[type=number] { width: 84px; padding: 7px 8px; border: 1px solid var(--line); border-radius: 4px;
+                       background: var(--panel); color: var(--ink); font: inherit; }
+  button { font: 700 .95rem "Atkinson Hyperlegible", sans-serif; padding: 9px 14px; border-radius: 4px;
+           border: 1px solid var(--ink); background: transparent; color: var(--ink); cursor: pointer; }
+  button.primary { background: var(--ink); color: var(--bg); }
+  button:disabled { opacity: .45; cursor: progress; }
+  :focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; }
+  #status { min-height: 1.5em; margin: 12px 0 0; color: var(--muted); }
+  #status.err { color: var(--bad); }
+
+  .hero { display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: 28px; margin-top: 24px; }
+  @media (max-width: 860px) { .hero { grid-template-columns: 1fr; } }
+  .board { display: grid; grid-template-columns: repeat(10, minmax(0, 1fr)); gap: 5px; }
+  .tile { aspect-ratio: 1.25; border-radius: 3px; background: var(--queued); color: #fff; position: relative;
+          display: flex; flex-direction: column; justify-content: space-between; padding: 4px 6px;
+          font-family: "Barlow Condensed", sans-serif; font-weight: 600; border: 0; text-align: left;
+          transition: background-color .35s ease; }
+  .tile .id { font-size: .95rem; line-height: 1; }
+  .tile .p { font-size: .8rem; opacity: .9; line-height: 1; }
+  .tile.in_progress { background: var(--inflight); color: #1C2A36; }
+  .tile.resolved { background: var(--resolved); }
+  .tile.human_review { background: var(--human); }
+  .tile.empty { background: transparent; border: 1px dashed var(--line); color: var(--muted); }
+  .tile.takeover::after { content: ""; position: absolute; top: 4px; right: 4px; width: 9px; height: 9px;
+          border-radius: 50%; background: #fff; box-shadow: 0 0 0 2px var(--bad); }
+  .tile.unsat { box-shadow: inset 0 -4px 0 var(--bad); }
+  @media (prefers-reduced-motion: reduce) { .tile { transition: none; } }
+  .legend { display: flex; flex-wrap: wrap; gap: 6px 16px; margin-top: 10px; font-size: .85rem; color: var(--muted); }
+  .legend i { display: inline-block; width: 12px; height: 12px; border-radius: 2px; margin-right: 6px; vertical-align: -1px; }
+
+  .runbox dl { margin: 0; display: grid; grid-template-columns: auto 1fr; gap: 6px 14px; }
+  .runbox dt { color: var(--muted); }
+  .runbox dd { margin: 0; font-weight: 700; }
+  .big { font-size: 3rem; line-height: 1; font-weight: 700; }
+  .runstate { display: inline-block; padding: 2px 8px; border-radius: 3px; font-weight: 700; font-size: .85rem;
+              background: var(--line); color: var(--ink); }
+  .runstate.running, .runstate.starting { background: var(--inflight); color: #1C2A36; }
+  .runstate.complete { background: var(--resolved); color: #fff; }
+  .runstate.stalled, .runstate.failed { background: var(--bad); color: #fff; }
+
+  section { margin-top: 36px; }
+  .cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 28px; }
+  .bars { display: grid; gap: 6px; }
+  .bar { display: grid; grid-template-columns: 80px 1fr 40px; gap: 8px; align-items: center; font-size: .9rem; }
+  .bar span.track { height: 14px; background: var(--line); border-radius: 2px; overflow: hidden; }
+  .bar span.fill { display: block; height: 100%; background: var(--ink); }
+  table { width: 100%; border-collapse: collapse; font-size: .9rem; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--muted); font-weight: 700; }
+  td.n, th.n { text-align: right; font-variant-numeric: tabular-nums; }
+  .scroll { overflow-x: auto; }
+  .ws { font-weight: 700; }
+  .ws.killed { color: var(--bad); }
+  .ws.running { color: var(--inflight); }
+  .offers { color: var(--muted); font-size: .85rem; }
+  .offers b { color: var(--ink); font-weight: 700; }
+  tr.sel { background: var(--panel); }
+  .empty-note { color: var(--muted); }
+  #detail { background: var(--panel); border-left: 4px solid var(--ink); padding: 12px 14px; margin-top: 14px; }
+  #detail[hidden] { display: none; }
+  #detail ol { margin: 6px 0 0; padding-left: 22px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div>
+      <h1>MSP re-booking desk</h1>
+      <p class="sub">Winter-storm cancellations, re-booked by a pool of workers you can kill mid-flight. Every record should end resolved or with a human, none lost.</p>
+    </div>
+    <form class="controls" id="controls">
+      <label>Workers <input type="number" id="workers" min="1" max="8" value="4"></label>
+      <label>Reject % <input type="number" id="reject" min="0" max="100" value="50"></label>
+      <label>Kill workers <input type="number" id="kill" min="0" max="7" value="0"></label>
+      <button type="submit" class="primary" id="btn-run">Start run</button>
+      <button type="button" id="btn-load">Load records</button>
+      <button type="button" id="btn-reset">Reset</button>
+    </form>
+  </header>
+  <p id="status" role="status" aria-live="polite"></p>
+
+  <div class="hero">
+    <div>
+      <div class="board" id="board" aria-label="Customer records"></div>
+      <div class="legend">
+        <span><i style="background:var(--queued)"></i>Waiting for a worker</span>
+        <span><i style="background:var(--inflight)"></i>Being re-booked</span>
+        <span><i style="background:var(--resolved)"></i>Accepted an offer</span>
+        <span><i style="background:var(--human)"></i>Sent to a person</span>
+        <span>White dot: picked up after a worker died</span>
+        <span>Red underline: outcome outside the golden set</span>
+      </div>
+      <div id="detail" hidden></div>
+    </div>
+    <aside class="runbox" id="runbox"></aside>
+  </div>
+
+  <section class="cols">
+    <div><h2>Passes to close a record</h2><div class="bars" id="passes"></div></div>
+    <div><h2>Workers</h2><div class="scroll"><table id="workers-t"></table></div></div>
+    <div><h2>Queues</h2><div class="scroll"><table id="queues-t"></table></div></div>
+  </section>
+
+  <section>
+    <h2>Recent runs</h2>
+    <div class="scroll"><table id="runs-t"></table></div>
+  </section>
+
+  <section>
+    <h2>Records in the latest run</h2>
+    <div class="scroll"><table id="records-t"></table></div>
+  </section>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let data = null, busy = false, timer = null, selected = null;
+
+function esc(s) { return String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
+function ago(s) { if (s == null) return "–"; s = Math.round(s); return s < 90 ? `${s}s` : `${Math.round(s/60)}m`; }
+function when(t) { return t ? new Date(t * 1000).toLocaleTimeString() : "–"; }
+function say(msg, err) { $("status").textContent = msg; $("status").className = err ? "err" : ""; }
+
+async function call(path, label) {
+  if (busy) return;
+  busy = true; document.querySelectorAll("button").forEach(b => b.disabled = true);
+  say(`${label}…`);
+  try {
+    const r = await fetch(path, { method: "POST" });
+    const body = await r.json();
+    if (!r.ok) throw new Error(body.error || r.statusText);
+    if (path.startsWith("/run")) say(`Run ${body.run_id} started with ${body.workers} workers, ${body.reject_percent}% rejections, ${body.kill_workers} to be killed.`);
+    else if (path === "/load") say(`Loaded ${body.loaded} records in ${body.seconds}s (${body.wcu_per_sec_actual} write units/s).`);
+    else say(`Reset: deleted ${body.deleted_records} records and ${body.deleted_run_items} run items.`);
+  } catch (e) { say(`${label} failed: ${e.message}`, true); }
+  finally { busy = false; document.querySelectorAll("button").forEach(b => b.disabled = false); refresh(); }
+}
+
+$("controls").addEventListener("submit", (e) => {
+  e.preventDefault();
+  const q = new URLSearchParams({ workers: $("workers").value, reject_percent: $("reject").value, kill_workers: $("kill").value });
+  call(`/run?${q}`, "Starting run");
+});
+$("btn-load").onclick = () => call("/load", "Loading records");
+$("btn-reset").onclick = () => { if (confirm("Delete all records and run history?")) call("/reset", "Resetting"); };
+$("workers").oninput = () => { $("kill").max = Math.max(0, $("workers").value - 1); };
+
+function renderBoard(run, total) {
+  const recs = run ? run.records : [];
+  const cells = recs.length ? recs : Array.from({ length: Math.max(total, 100) }, () => null);
+  $("board").innerHTML = cells.map((r) => {
+    if (!r) return `<div class="tile empty"><span class="id">–</span></div>`;
+    const cls = [r.status, r.takeovers ? "takeover" : "", (r.status === "resolved" && !r.satisfactory) ? "unsat" : ""].join(" ");
+    const short = r.case_id.slice(-3);
+    return `<button class="tile ${cls}" data-id="${esc(r.case_id)}" title="${esc(r.case_id)}: ${esc(r.status)}, pass ${r.pass_no}, fencing token ${r.fencing_token}">
+      <span class="id">${short}</span><span class="p">pass ${r.pass_no ?? "–"}, ft ${r.fencing_token ?? 0}</span></button>`;
+  }).join("");
+  $("board").querySelectorAll("button.tile").forEach(b => b.onclick = () => { selected = b.dataset.id; renderDetail(); });
+}
+
+function renderDetail() {
+  const run = data && data.latest_run;
+  const r = run && run.records.find(x => x.case_id === selected);
+  if (!r) { $("detail").hidden = true; return; }
+  $("detail").hidden = false;
+  $("detail").innerHTML = `<strong>${esc(r.case_id)}</strong> to ${esc(r.destination)}, ${esc(r.cabin)}, party of ${r.party_size}, ${esc(r.urgency)}${r.travel_concerns !== "none" ? ", " + esc(r.travel_concerns) : ""}.
+    Fencing token ${r.fencing_token}, claimed ${r.claims ?? 0} times this run${r.lease_owner ? `, held by ${esc(r.lease_owner)}` : ""}.
+    <ol>${r.offers.map(o => { const [off, res] = o.split(":"); return `<li>${esc(off)}: ${esc(res)}</li>`; }).join("") || "<li>No offers yet</li>"}</ol>`;
+}
+
+function renderRunbox(run) {
+  if (!run) { $("runbox").innerHTML = `<h2>No runs yet</h2><p class="empty-note">Load records, then start a run.</p>`; return; }
+  const s = run.stats;
+  $("runbox").innerHTML = `
+    <h2>Latest run <span class="runstate ${esc(run.status)}">${esc(run.status)}</span></h2>
+    <p class="num big">${s.resolved + s.human_review}<span style="font-size:1.4rem"> / ${s.records} closed</span></p>
+    <dl>
+      <dt>Accepted an offer</dt><dd>${s.resolved}</dd>
+      <dt>Inside golden set</dt><dd>${s.satisfactory}</dd>
+      <dt>Sent to a person</dt><dd>${s.human_review}</dd>
+      <dt>Still open</dt><dd>${s.open}</dd>
+      <dt>Average passes</dt><dd>${s.avg_passes}</dd>
+      <dt>Oldest unpicked</dt><dd>${s.oldest_unpicked ? `${esc(s.oldest_unpicked.case_id)}, ${ago(s.oldest_unpicked.waiting_s)}` : "none"}</dd>
+      <dt>Oldest unresolved</dt><dd>${s.oldest_unresolved ? `${esc(s.oldest_unresolved.case_id)}, ${ago(s.oldest_unresolved.waiting_s)}` : "none"}</dd>
+      <dt>Recovered after a crash</dt><dd>${s.takeovers_after_crash}</dd>
+      <dt>Late writes fenced off</dt><dd>${s.worker_totals.fenced}</dd>
+      <dt>Lost handoffs repaired</dt><dd>${s.worker_totals.repaired}</dd>
+      <dt>Workers alive</dt><dd>${s.workers_alive} of ${run.workers}</dd>
+      <dt>Elapsed</dt><dd>${ago(s.duration_s)}</dd>
+    </dl>
+    <p class="empty-note" style="margin-top:10px">${esc(run.run_id)}: ${run.workers} workers, ${run.reject_percent}% rejections, ${run.kill_workers} killed.</p>`;
+}
+
+function renderPasses(run) {
+  const p = run ? run.stats.passes_to_close : {};
+  const max = Math.max(1, ...Object.values(p));
+  const keys = Object.keys(p);
+  $("passes").innerHTML = keys.length ? keys.map(k => `<div class="bar"><span>${k} pass${k === "1" ? "" : "es"}</span>
+    <span class="track"><span class="fill" style="width:${100 * p[k] / max}%"></span></span><span class="num">${p[k]}</span></div>`).join("")
+    : `<p class="empty-note">Appears as records close.</p>`;
+}
+
+function renderWorkers(run) {
+  const ws = run ? run.workers : [];
+  $("workers-t").innerHTML = ws.length ? `<tr><th>Worker</th><th>State</th><th class="n">Done</th><th class="n">Took over</th><th class="n">Fenced</th><th>Last seen</th></tr>` +
+    ws.map(w => `<tr><td>${esc(w.worker_id)}</td><td class="ws ${esc(w.status)}">${esc(w.status)}${w.kill_plan ? `<div class="offers">kill planned ${esc(w.kill_plan)}</div>` : ""}</td>
+      <td class="n">${w.completed}</td><td class="n">${w.takeovers}</td><td class="n">${w.fenced}</td>
+      <td>${ago(data.generated_at - w.heartbeat_at)} ago</td></tr>`).join("")
+    : `<tr><td class="empty-note">Workers appear when a run starts.</td></tr>`;
+}
+
+function renderQueues(q) {
+  $("queues-t").innerHTML = `<tr><th>Queue</th><th class="n">Waiting</th><th class="n">In flight</th></tr>` +
+    Object.entries(q || {}).map(([k, v]) => `<tr><td>${k.replace("_", " ")}</td><td class="n">${v.visible}</td><td class="n">${v.in_flight}</td></tr>`).join("");
+}
+
+function renderRuns(runs) {
+  $("runs-t").innerHTML = runs.length ? `<tr><th>Run</th><th>Started</th><th>State</th><th class="n">Workers</th><th class="n">Reject %</th><th class="n">Killed</th>
+      <th class="n">Accepted</th><th class="n">In golden set</th><th class="n">To a person</th><th class="n">Avg passes</th><th class="n">Took</th></tr>` +
+    runs.map(r => { const f = r.final || {}; return `<tr><td>${esc(r.run_id)}</td><td>${when(r.started_at)}</td><td>${esc(r.status)}</td>
+      <td class="n">${r.workers}</td><td class="n">${r.reject_percent}</td><td class="n">${r.kill_workers}</td>
+      <td class="n">${f.resolved ?? "–"}</td><td class="n">${f.satisfactory ?? "–"}</td><td class="n">${f.human_review ?? "–"}</td>
+      <td class="n">${f.avg_passes ?? "–"}</td><td class="n">${f.duration_s != null ? ago(f.duration_s) : "–"}</td></tr>`; }).join("")
+    : `<tr><td class="empty-note">No runs yet.</td></tr>`;
+}
+
+function renderRecords(run) {
+  const rs = run ? run.records : [];
+  $("records-t").innerHTML = rs.length ? `<tr><th>Case</th><th>State</th><th class="n">Passes</th><th>Outcome</th><th>Offers made</th><th class="n">Fencing token</th><th class="n">Claims</th></tr>` +
+    rs.map(r => `<tr class="${r.case_id === selected ? "sel" : ""}"><td>${esc(r.case_id)}</td><td>${esc(r.status)}</td><td class="n">${r.pass_no}</td>
+      <td>${esc(r.resolution || "")}${r.status === "resolved" && !r.satisfactory ? " (outside golden set)" : ""}</td>
+      <td class="offers">${r.offers.map(o => { const [off, res] = o.split(":"); return `${esc(off)} <b>${esc(res)}</b>`; }).join(", ")}</td>
+      <td class="n">${r.fencing_token}</td><td class="n">${r.claims ?? 0}${r.takeovers ? ` (${r.takeovers} after crash)` : ""}</td></tr>`).join("")
+    : `<tr><td class="empty-note">Records appear here once a run starts.</td></tr>`;
+}
+
+async function refresh() {
+  clearTimeout(timer);
+  try {
+    const r = await fetch("/results", { cache: "no-store" });
+    data = await r.json();
+    if (!r.ok) throw new Error(data.error || r.statusText);
+    const run = data.latest_run;
+    renderBoard(run, data.records_in_table); renderRunbox(run); renderPasses(run);
+    renderWorkers(run); renderQueues(data.queues); renderRuns(data.recent_runs || []); renderRecords(run); renderDetail();
+    if (!run && !busy) say(data.records_in_table ? `${data.records_in_table} records loaded. Start a run.` : "No records loaded. Load records to begin.");
+  } catch (e) { say(`Couldn't read results: ${e.message}`, true); }
+  const live = data && data.latest_run && ["starting", "running", "stalled"].includes(data.latest_run.status);
+  timer = setTimeout(refresh, live ? 2500 : 10000);
+}
+refresh();
+</script>
+</body>
+</html>
