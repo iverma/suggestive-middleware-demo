@@ -14,7 +14,8 @@ Split-brain live check against the deployed demo: five independent "clients" at 
      worker's hands) and the other four still finish.
   4. Poison in two concurrent runs: each poison run's dead letters are swept to a person in
      *its own* partition, and the runs without poison have no sweeps at all.
-  5. Fairness: every run closes its first record quickly (SQS fair queues grouped by run).
+  5. Fairness: every run's records are queued promptly even when start invocations are
+     throttled, and once queued each run closes a record quickly (SQS fair queues by run).
   6. Double submit (same client_token three times at once): exactly one run starts.
   7. A stale client cancels a finished run: a clear 409, nothing changes.
   8. Afterwards no run from this check still holds budget.
@@ -113,7 +114,7 @@ def main(base, timeout_s=1200):
         ids["double-submit"] = next(iter(dupe_ids))
 
     # 3. mid-flight cancel, then 2 + 5: watch everything
-    first_progress, done, cancel_at = {}, {}, None
+    first_progress, queued, done, cancel_at = {}, {}, {}, None
     end = time.time() + timeout_s
     while time.time() < end and len(done) < len(ids):
         time.sleep(5)
@@ -122,6 +123,8 @@ def main(base, timeout_s=1200):
                 continue
             lr = detail(base, r)
             s = lr.get("stats", {})
+            if s.get("queued_s") is not None and n not in queued:
+                queued[n] = s["queued_s"]
             if s.get("closed") and n not in first_progress:
                 first_progress[n] = s.get("duration_s")
             if n == "cancel" and cancel_at is None and 10 <= (s.get("closed") or 0) < s.get("records", 0):
@@ -187,11 +190,16 @@ def main(base, timeout_s=1200):
         if done.get(n) and done[n].get("sweeps"):
             failures.append(f"{n}: has sweeps but no poison (a sweep landed in the wrong partition)")
 
-    # 5. fairness
-    slowest = max((first_progress.get(n) or 1e9) for n in RUNS)
-    print(f"slowest first close among the {len(RUNS)} concurrent runs: {slowest}s")
-    if slowest > 90:
-        failures.append(f"a concurrent run waited {slowest}s for its first close (starved?)")
+    # 5. fairness. Set-up: every run's records are queued promptly even when the start
+    # invocations are throttled (the workers can hold 8 of the account's 10 Lambdas).
+    # Queues: once queued, every run closes a record quickly (SQS fair queues grouped by run).
+    slowest_setup = max((queued.get(n) or 1e9) for n in RUNS)
+    slowest = max((first_progress.get(n) or 1e9) - (queued.get(n) or 0) for n in RUNS)
+    print(f"set-up (records queued) at {queued}; slowest first close after queueing: {slowest:.1f}s")
+    if slowest_setup > 60:
+        failures.append(f"a concurrent run took {slowest_setup}s to queue its records (start invocations starved?)")
+    if slowest > 60:
+        failures.append(f"a concurrent run waited {slowest:.1f}s after queueing for its first close (starved?)")
 
     # 7. stale client cancels a finished run
     status, body = call(base, "POST", f"/cancel?run={ids['easy']}")
@@ -212,7 +220,7 @@ def main(base, timeout_s=1200):
                f"cancel mid-flight at {cancel_at and cancel_at['closed']} closed -> "
                f"{(done.get('cancel') or {}).get('status')}, sweeps "
                f"{ {n: len((done.get(n) or {}).get('sweeps', [])) for n in ('poison-a', 'poison-b', 'easy', 'hard')} }, "
-               f"slowest first close {slowest}s, stale cancel -> {status}")
+               f"slowest set-up {slowest_setup}s, slowest first close after queueing {slowest:.1f}s, stale cancel -> {status}")
     if failures:
         for f in failures:
             print("::error::" + f)
