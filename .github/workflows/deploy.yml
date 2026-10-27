@@ -31,7 +31,14 @@ jobs:
       - name: End-to-end tests (mocked DynamoDB + SQS, killed workers, zombie fencing)
         run: |
           pip install -q boto3 "moto[dynamodb,sqs]" pytest
-          python -m pytest infra/tests -q -p no:warnings
+          set +e
+          python -m pytest infra/tests -q -p no:warnings -rf 2>&1 | tee pytest.log
+          status=${PIPESTATUS[0]}
+          # Surface failures as annotations, readable without downloading the log.
+          grep -E "^(FAILED|ERROR) " pytest.log | head -10 | sed 's/^/::error title=Test failed::/'
+          grep -E "^E  " pytest.log | head -8 | sed 's/^/::error title=Assertion::/'
+          tail -1 pytest.log | sed 's/^/::notice title=Tests::/'
+          exit $status
 
   deploy:
     needs: test
