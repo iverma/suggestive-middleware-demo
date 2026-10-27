@@ -1,0 +1,45 @@
+name: Inspect
+
+# Read-only: prints the state of the latest runs as annotations (Actions logs can be hard to
+# reach). Run by hand, or push a change to this file.
+on:
+  workflow_dispatch:
+    inputs:
+      run: { description: "Run id (blank = latest)", default: "" }
+  push:
+    branches: [main]
+    paths: [".github/workflows/inspect.yml"]
+
+permissions:
+  contents: read
+
+env:
+  DEMO_URL: https://htd5qtuasvlslvzldh3bsragui0jdkwr.lambda-url.us-west-2.on.aws/
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Summarize runs
+        env:
+          RUN: ${{ inputs.run }}
+        run: |
+          python3 - <<'PY'
+          import json, os, urllib.request
+          base = os.environ["DEMO_URL"].rstrip("/")
+          def get(path):
+              with urllib.request.urlopen(base + path, timeout=60) as r:
+                  return json.loads(r.read())
+          top = get("/results")
+          print(f"::notice title=Budget::{top['budget']} active={[(r['run_id'], r['status'], r['closed'], r['records']) for r in top['active_runs']]}")
+          print(f"::notice title=Queues::{top['queues']} mappings={ {k: v['state'] for k, v in top['worker_mappings'].items()} }")
+          ids = [os.environ.get("RUN")] if os.environ.get("RUN") else [r["run_id"] for r in top["recent_runs"][:4]]
+          for rid in ids:
+              lr = get(f"/results?run={rid}")["latest_run"]
+              s = lr["stats"]
+              print(f"::notice title={rid} {lr['status']}::closed={s['closed']}/{s['records']} counts={s['status_counts']} "
+                    f"events={ {k: v for k, v in s['events'].items() if v} } degradation={ {k: v for k, v in s['degradation'].items() if v} } "
+                    f"crashes={s['kills_recovered']}/{s['kills_fired']} oldest_open={s['oldest_unresolved']} "
+                    f"knobs={ {k: lr.get(k) for k in ('reject_percent', 'kill_percent', 'slow_percent', 'dup_percent', 'poison_percent', 'throttle_percent')} } "
+                    f"error={lr.get('error')} duration={s['duration_s']}s")
+          PY
