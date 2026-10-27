@@ -53,6 +53,7 @@ MAX_DUP_PERCENT = 100
 MAX_POISON_PERCENT = 10   # each poisoned record waits out 5 failed deliveries, then the sweeper
 MAX_THROTTLE_PERCENT = 30 # share of worker AWS calls answered with a 400 throttle
 START_TIMEOUT_S = 120     # a run still "starting" after this never finished its start: fail it
+SETUP_CLAIM_S = 60        # a set-up claim older than this belongs to a dead invocation
 RUN_MAX_S = 30 * 60       # a run still active after this has stalled: fail it, free its budget
 STALL_S = LEASE_SECONDS + VISIBILITY_SECONDS + 30
 # Orphans: open records whose message is gone (every recovery path for them failed). When the
@@ -415,6 +416,51 @@ def _run_async(run_id):
         return {"run_id": run_id, "status": meta.get("status")}
     if meta.get("kind") == "load":
         return produce(run_id)
+    if not claim_setup(run_id):
+        return {"run_id": run_id, "status": "set up by another invocation"}
+    out = setup_run(run_id, meta)
+    adopt_starting(run_id)
+    return out
+
+
+def claim_setup(run_id):
+    """
+    One invocation sets a run up. The account allows 10 concurrent Lambdas and the workers may
+    hold 8, so several start invocations can sit throttled (Lambda retries them for minutes).
+    Whichever control invocation gets to a waiting run first claims it; a stale claim (its
+    invocation died) can be taken over.
+    """
+    t = now()
+    try:
+        ddb.update_item(TableName=RUNS_TABLE, Key=to_ddb(meta_key(run_id)),
+                        UpdateExpression="SET setup_at = :t",
+                        ConditionExpression="#st = :starting AND (attribute_not_exists(setup_at) OR setup_at < :stale)",
+                        ExpressionAttributeNames={"#st": "status"},
+                        ExpressionAttributeValues=to_ddb({":t": round(t, 3), ":starting": "starting",
+                                                          ":stale": round(t - SETUP_CLAIM_S, 3)}))
+        return True
+    except ddb.exceptions.ConditionalCheckFailedException:
+        return False
+
+
+def adopt_starting(done_run_id):
+    """
+    After setting up its own run, a start invocation sets up any other run still waiting for
+    its own (throttled) start invocation, so simultaneous starts don't wait on Lambda retries.
+    """
+    for run_id in sorted(admission()["active"] - {done_run_id}):
+        meta = get_meta(run_id, consistent=True)
+        if meta.get("status") != "starting" or meta.get("kind") == "load":
+            continue
+        if claim_setup(run_id):
+            try:
+                setup_run(run_id, meta)
+                print(dumps({"adopted_start": run_id}))
+            except Exception as e:
+                finish(run_id, "failed", error=f"run start failed: {type(e).__name__}: {e}"[:300])
+
+
+def setup_run(run_id, meta):
     safe_reconcile()                            # workers on early: overlaps with copying records
     t = float(meta["started_at"])
     pacer = WcuPacer(pace_rate(os.environ.get("RUN_INIT_WCU_PER_SEC")))

@@ -803,3 +803,42 @@ def test_load_run_counts_against_budget(env):
     handler, *_ = env
     status, body = http(handler, "POST", "/run", kind="load", records=handler.RECORD_BUDGET + 1)
     assert status == 400 or status == 409, body
+
+
+def test_throttled_start_invocations_are_adopted(env):
+    """
+    The workers can hold 8 of the account's 10 concurrent Lambdas, so simultaneous start
+    invocations can sit throttled for minutes. The first one to run sets the others up too.
+    """
+    handler, common, *_ = env
+    assert http(handler, "POST", "/load")[0] == 200
+    real = handler.lam.invoke
+    first = threading.Event()
+
+    def throttled(FunctionName, InvocationType, Payload):
+        ev = json.loads(Payload)
+        if ev.get("internal") == "start_run" and first.is_set():
+            def later():
+                time.sleep(20)                  # Lambda retrying a throttled async invoke
+                real(FunctionName=FunctionName, InvocationType=InvocationType, Payload=Payload)
+            threading.Thread(target=later, daemon=True).start()
+            return {"StatusCode": 202}
+        first.set()
+        return real(FunctionName=FunctionName, InvocationType=InvocationType, Payload=Payload)
+    handler.lam.invoke = throttled
+    ids = [start(handler, kind="integration", reject_percent=0, client_token=str(uuid.uuid4())) for _ in range(3)]
+    time.sleep(0.2)
+    end = time.time() + 15
+    while time.time() < end and any(handler.get_meta(r, consistent=True)["status"] == "starting" for r in ids):
+        time.sleep(0.2)
+    metas = [handler.get_meta(r, consistent=True) for r in ids]
+    assert all(m["status"] != "starting" for m in metas), [m["status"] for m in metas]
+    for r in ids:
+        res = wait_complete(handler, r, timeout=150)["latest_run"]
+        assert res["stats"]["closed"] == res["stats"]["records"]
+        assert not res["stats"]["races"]["double_commits"]
+    time.sleep(21)                              # the late invocations arrive and find nothing to do
+    for r in ids:
+        ev = handler.query_all(KeyConditionExpression="pk = :p AND sk = :s",
+                               ExpressionAttributeValues=common.to_ddb({":p": common.run_pk(r), ":s": "EVENTS"}))
+        assert not (ev and ev[0].get("duplicates_sent")), "a run was set up twice"

@@ -37,6 +37,9 @@ jobs:
           for rid in ids:
               lr = get(f"/results?run={rid}")["latest_run"]
               s = lr["stats"]
+              if lr.get("kind") == "load":
+                  print(f"::notice title={rid} load {lr['status']}::stats={s} summary={lr.get('summary')} error={lr.get('error')}")
+                  continue
               print(f"::notice title={rid} {lr['status']}::closed={s['closed']}/{s['records']} counts={s['status_counts']} "
                     f"events={ {k: v for k, v in s['events'].items() if v} } degradation={ {k: v for k, v in s['degradation'].items() if v} } "
                     f"crashes={s['kills_recovered']}/{s['kills_fired']} oldest_open={s['oldest_unresolved']} "
