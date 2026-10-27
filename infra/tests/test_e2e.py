@@ -69,7 +69,7 @@ class FakeEsm:
         self.envs = threading.local()
         self.threads = [threading.Thread(target=self.poll, args=(name,), daemon=True)
                         for name, (_, _, mx) in queues.items() for _ in range(mx)]
-        worker.env_id = lambda: self.envs.id
+        worker.env_id = lambda: getattr(self.envs, "id", "env-main")
         for t in self.threads:
             t.start()
 
@@ -114,16 +114,18 @@ def atomic_dynamodb(monkeypatch):
     so two threads can both pass the same condition. Real DynamoDB makes each conditional write
     atomic per item; serializing moto's DynamoDB calls restores that guarantee in the simulator.
     """
-    import botocore.client
+    import botocore.endpoint
     lock = threading.Lock()
-    real = botocore.client.BaseClient._make_api_call
+    real = botocore.endpoint.Endpoint._do_get_response
 
-    def call(self, operation, params):
-        if self.meta.service_model.service_name == "dynamodb":
+    # Lock each HTTP attempt, not the whole API call: botocore's retry sleeps happen between
+    # attempts and must not block other workers (DynamoDB never serializes callers like that).
+    def attempt(self, request, operation_model, context):
+        if operation_model.service_model.service_name == "dynamodb":
             with lock:
-                return real(self, operation, params)
-        return real(self, operation, params)
-    monkeypatch.setattr(botocore.client.BaseClient, "_make_api_call", call)
+                return real(self, request, operation_model, context)
+        return real(self, request, operation_model, context)
+    monkeypatch.setattr(botocore.endpoint.Endpoint, "_do_get_response", attempt)
 
 
 @pytest.fixture()
@@ -142,7 +144,7 @@ def env():
         dlq = sqs.create_queue(QueueName="dlq")["QueueUrl"]
         dlq_arn = sqs.get_queue_attributes(QueueUrl=dlq, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
         attrs = {"VisibilityTimeout": str(VIS),
-                 "RedrivePolicy": json.dumps({"deadLetterTargetArn": dlq_arn, "maxReceiveCount": "10"})}
+                 "RedrivePolicy": json.dumps({"deadLetterTargetArn": dlq_arn, "maxReceiveCount": "5"})}
         queues = {}
         for name, mx in (("rebooking", 5), ("rerouting", 3)):
             url = sqs.create_queue(QueueName=f"effect-demo-{name}", Attributes=attrs)["QueueUrl"]
@@ -152,7 +154,7 @@ def env():
         os.environ["DLQ_URL"] = dlq
 
         sys.path.insert(0, str(SRC))
-        for m in ("common", "worker", "handler"):
+        for m in ("common", "worker", "handler", "sweeper", "throttle"):
             sys.modules.pop(m, None)
         import common, handler, worker  # noqa: E401
 
@@ -241,7 +243,10 @@ def test_autoscaled_run_with_killed_workers_loses_nothing(env):
     assert s["satisfactory"] == s["resolved"]                  # rules pass never leaves the golden set
     assert not any(r["unacceptable_offered"] for r in run["records"])
     # crashes on every pass, both modes, each one recovered the way its kill point predicts
-    assert s["kills_fired"] >= 10 and s["kills_fired"] == esm.kills + esm.faults
+    # exit-mode crashes kill the environment; raise-mode ones are caught by the worker's
+    # catch-all and reported as a failed message (the environment survives)
+    assert s["kills_fired"] >= 10 and s["kills_fired"] == esm.kills + s["events"]["failed_injected"]
+    assert esm.faults == 0                                    # nothing escaped the catch-all
     assert s["kills_recovered"] == s["kills_fired"], [k for k in run["kills"] if not k["recovered"]]
     assert any(int(k["pass"]) > 1 for k in run["kills"])
     assert sum(1 for w in run["workers"] if w["state"] == "killed") == esm.kills
@@ -444,3 +449,135 @@ def test_results_tolerates_kill_items_from_older_versions(env):
     status, res = http(handler, "GET", "/results")
     assert status == 200, res
     assert res["latest_run"]["kills"][0]["point"] == "before_commit"
+
+
+def sweeper_ticks(stop, every=1.0):
+    """Stand-in for the 1-minute EventBridge schedule, sped up."""
+    import sweeper
+    results = []
+    while not stop.is_set():
+        results.append(sweeper.handler({}, Ctx(60)))
+        time.sleep(every)
+    return results
+
+
+def test_throttled_aws_calls_back_off_and_lose_nothing(env, monkeypatch):
+    """20% of the workers' DynamoDB/SQS calls get a 400 throttle; retries and backoff absorb it."""
+    handler, common, worker, esm, threads = env
+    # Tests shrink the 15s lease to 4s; shrink the SDK's retry sleeps by the same ratio, or a
+    # retrying worker would overrun its lease far more often than it can on AWS.
+    import botocore.retries.standard as std
+    real_delay = std.ExponentialBackoff.delay_amount
+    monkeypatch.setattr(std.ExponentialBackoff, "delay_amount",
+                        lambda self, ctx: real_delay(self, ctx) * LEASE / 15)
+    stop = threading.Event()
+    threading.Thread(target=sweeper_ticks, args=(stop,), daemon=True).start()   # always on in production
+    try:
+        http(handler, "POST", "/load")
+        assert http(handler, "POST", "/run", reject_percent=50, throttle_percent=20)[0] == 202
+        res = wait_complete(handler, timeout=300)
+    finally:
+        stop.set()
+    s = res["latest_run"]["stats"]
+    d = s["degradation"]
+    print(json.dumps({**d, "fenced": s["events"]["fenced"], "deferred": s["events"]["deferred"],
+                      "repaired": s["events"]["repaired"], "takeovers": s["takeovers_after_crash"]}))
+
+    assert s["open"] == 0 and s["resolved"] + s["human_review"] == 100
+    assert d["dead_lettered_swept"] <= 3                              # degraded, never lost
+    assert d["throttles_injected"] >= 50 and d["sdk_retries"] >= d["throttles_injected"] * 0.8
+    assert s["races"]["double_commits"] == 0
+    assert d["throttled_after_retries"] == d["message_backoffs"]      # every exhausted one backed off
+    assert esm.faults == 0
+
+
+def test_poison_messages_dead_letter_and_are_swept_to_a_person(env):
+    handler, common, worker, esm, threads = env
+    poisoned = {"IROPS-MSP-0007", "IROPS-MSP-0042"}
+    real = common.poison_plan
+    common.poison_plan = lambda run_id, case_id, pass_no, pct=0: case_id in poisoned and pass_no == 1
+    stop = threading.Event()
+    ticker = threading.Thread(target=sweeper_ticks, args=(stop,), daemon=True)
+    ticker.start()
+    try:
+        http(handler, "POST", "/load")
+        assert http(handler, "POST", "/run", reject_percent=30, poison_percent=1)[0] == 202
+        res = wait_complete(handler, timeout=240)
+    finally:
+        stop.set()
+        common.poison_plan = real
+    run, s = res["latest_run"], res["latest_run"]["stats"]
+    print(json.dumps(s["degradation"]))
+    assert s["open"] == 0
+    for r in run["records"]:
+        if r["case_id"] in poisoned:
+            assert r["status"] == "human_review" and r["swept"], r
+            assert r["history"][-1]["w"] == "sweeper" and r["history"][-1]["r"] == "dead_lettered"
+    assert {w["case_id"] for w in run["sweeps"]} == poisoned
+    assert s["degradation"]["poison_failures"] >= 2 * 5               # every delivery failed
+    assert any(i["kind"] == "swept" for i in run["incidents"])
+    assert res["queues"]["dead_letter"]["visible"] == 0
+
+
+def test_unreadable_message_is_dropped_by_the_sweeper(env):
+    handler, common, worker, esm, threads = env
+    import sweeper
+    out = worker.handler({"Records": [{"messageId": "m", "receiptHandle": "r", "body": "{not json",
+                                       "eventSourceARN": "arn:aws:sqs:us-east-1:1:effect-demo-rebooking"}]}, Ctx())
+    assert out == {"batchItemFailures": [{"itemIdentifier": "m"}]}   # caught, not raised
+    common.sqs.send_message(QueueUrl=common.DLQ, MessageBody="{not json")
+    assert sweeper.handler({}, Ctx(60))["unreadable"] == 1
+
+
+def test_run_start_failure_rolls_back_and_frees_the_lock(env):
+    handler, common, worker, esm, threads = env
+    http(handler, "POST", "/load")
+    real = handler.outgoing
+    calls = {"n": 0}
+
+    def flaky(*a, **kw):
+        calls["n"] += 1
+        if calls["n"] > 30:
+            raise RuntimeError("SQS fell over mid-send")
+        return real(*a, **kw)
+    handler.outgoing = flaky
+    try:
+        assert http(handler, "POST", "/run")[0] == 202
+        for t in threads:
+            t.join(10)
+    finally:
+        handler.outgoing = real
+    _, res = http(handler, "GET", "/results")
+    run = res["recent_runs"][0]
+    assert run["status"] == "failed" and "mid-send" in run["error"]
+    assert not any(esm.enabled.values())                               # workers switched off
+    assert http(handler, "POST", "/run", reject_percent=0)[0] == 202   # lock released immediately
+    assert wait_complete(handler)["latest_run"]["stats"]["open"] == 0
+
+
+def test_housekeeping_rolls_back_a_run_whose_start_died(env):
+    handler, common, *_ = env
+    t = time.time() - handler.START_TIMEOUT_S - 5
+    summary = {"pk": "RUN", "sk": "2026-10-27T10:00:00+00:00#run-dead", "run_id": "run-dead", "status": "starting",
+               "started_at": t, "reject_percent": 50}
+    assert handler.acquire_lock(summary, t)
+    out = handler.handler({"internal": "housekeeping"}, Ctx(600))
+    assert out["rolled_back"] == "run-dead"
+    _, res = http(handler, "GET", "/results")
+    assert res["recent_runs"][0]["status"] == "failed"
+
+
+def test_lock_and_completion_are_atomic(env):
+    handler, common, *_ = env
+    t = time.time()
+    a = {"pk": "RUN", "sk": "2026-10-27T10:00:00+00:00#run-a", "run_id": "run-a", "status": "starting",
+         "started_at": t, "reject_percent": 50}
+    b = {**a, "sk": "2026-10-27T10:00:01+00:00#run-b", "run_id": "run-b"}
+    assert handler.acquire_lock(a, t) is True
+    assert handler.acquire_lock(b, t) is False                         # lock held
+    _, res = http(handler, "GET", "/results")
+    assert [r["run_id"] for r in res["recent_runs"]] == ["run-a"]      # no orphan summary for b
+    # two callers finishing the same run: exactly one wins
+    assert handler.set_run_status("run-a", a["sk"], "complete", expect=["starting", "running"]) is True
+    assert handler.set_run_status("run-a", a["sk"], "complete", expect=["starting", "running"]) is False
+    assert handler.acquire_lock(b, t) is True                          # finished run frees the lock

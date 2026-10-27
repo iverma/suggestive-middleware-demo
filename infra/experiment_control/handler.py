@@ -6,7 +6,8 @@ Served publicly through a Lambda Function URL:
   GET  /results          latest run: outcomes, passes per record, oldest unpicked, workers, recent runs
   POST /reset            stop any run, purge queues, delete every item in both tables
   POST /load             paced load of the golden-set inputs (?wcu_per_sec=N)
-  POST /run              start a run (?reject_percent=50&kill_percent=0&slow_percent=0&dup_percent=0)
+  POST /run              start a run (?reject_percent=50&kill_percent=0&slow_percent=0&dup_percent=0
+                         &poison_percent=0&throttle_percent=0)
 
 Workers are not launched by this function. They are the worker Lambda, invoked
 by SQS event source mappings that Lambda autoscales from queue depth. This
@@ -37,6 +38,9 @@ from common import (
 MAX_KILL_PERCENT = 50     # every message crashing once doubles a run's work; keep runs sane
 MAX_SLOW_PERCENT = 20     # each slow pass holds a worker for ~15-20s
 MAX_DUP_PERCENT = 100
+MAX_POISON_PERCENT = 10   # each poisoned record waits out 5 failed deliveries, then the sweeper
+MAX_THROTTLE_PERCENT = 30 # share of worker AWS calls answered with a 400 throttle
+START_TIMEOUT_S = 120     # a run still "starting" after this never finished its start: roll it back
 RUN_LOCK_S = 30 * 60
 STALL_S = LEASE_SECONDS + VISIBILITY_SECONDS + 30
 RESET_SETTLE_S = float(os.environ.get("RESET_SETTLE_S", "4"))
@@ -163,63 +167,118 @@ def _int_param(params, name, default, lo, hi):
     return v
 
 
-def acquire_lock(run_id, sk, t, reject, kn):
-    ddb.put_item(
-        TableName=RUNS_TABLE,
-        Item=to_ddb({**CONTROL_KEY, "run_id": run_id, "summary_sk": sk, "status": "starting",
-                     "reject_percent": reject, **kn, "started_at": round(t, 3),
-                     "expires_at": round(t + RUN_LOCK_S, 3)}),
-        ConditionExpression="attribute_not_exists(pk) OR expires_at < :t OR NOT (#st IN (:s, :r))",
-        ExpressionAttributeNames={"#st": "status"},
-        ExpressionAttributeValues=to_ddb({":t": round(t, 3), ":s": "starting", ":r": "running"}),
-    )
+def acquire_lock(summary, t):
+    """
+    Take the run lock and create the run's summary in ONE transaction: either both exist or
+    neither does, so a crash here can never leave a lock with no run behind it (which would
+    block /run for the lock's lifetime). The lock is free when there is none, it expired, or
+    its run has finished.
+    """
+    lock = {**CONTROL_KEY, "run_id": summary["run_id"], "summary_sk": summary["sk"], "status": "starting",
+            "reject_percent": summary["reject_percent"], **knobs(summary), "started_at": round(t, 3),
+            "expires_at": round(t + RUN_LOCK_S, 3)}
+    try:
+        ddb.transact_write_items(TransactItems=[
+            {"Put": {"TableName": RUNS_TABLE, "Item": to_ddb(lock),
+                     "ConditionExpression": "attribute_not_exists(pk) OR expires_at < :t OR NOT (#st IN (:s, :r))",
+                     "ExpressionAttributeNames": {"#st": "status"},
+                     "ExpressionAttributeValues": to_ddb({":t": round(t, 3), ":s": "starting", ":r": "running"})}},
+            {"Put": {"TableName": RUNS_TABLE, "Item": to_ddb(summary),
+                     "ConditionExpression": "attribute_not_exists(pk)"}},
+        ])
+        return True
+    except ddb.exceptions.TransactionCanceledException:
+        return False
 
 
 def start_run(params):
     reject = _int_param(params, "reject_percent", 50, 0, 100)
     kn = {"kill_percent": _int_param(params, "kill_percent", 0, 0, MAX_KILL_PERCENT),
           "slow_percent": _int_param(params, "slow_percent", 0, 0, MAX_SLOW_PERCENT),
-          "dup_percent": _int_param(params, "dup_percent", 0, 0, MAX_DUP_PERCENT)}
+          "dup_percent": _int_param(params, "dup_percent", 0, 0, MAX_DUP_PERCENT),
+          "poison_percent": _int_param(params, "poison_percent", 0, 0, MAX_POISON_PERCENT),
+          "throttle_percent": _int_param(params, "throttle_percent", 0, 0, MAX_THROTTLE_PERCENT)}
     t = now()
     stamp = datetime.fromtimestamp(t, timezone.utc)
     run_id = f"run-{stamp:%Y%m%d-%H%M%S}-{random.randint(0, 0xffff):04x}"
     sk = f"{stamp.isoformat(timespec='seconds')}#{run_id}"
-    try:
-        acquire_lock(run_id, sk, t, reject, kn)
-    except ddb.exceptions.ConditionalCheckFailedException:
-        results(force=True)                     # marks the current run complete if it is
-        try:
-            acquire_lock(run_id, sk, now(), reject, kn)
-        except ddb.exceptions.ConditionalCheckFailedException:
-            raise HttpError(409, "a run is already in progress; wait for it to finish or POST /reset")
     max_workers = sum(e["max"] for e in ESMS.values())
     summary = {"pk": "RUN", "sk": sk, "run_id": run_id, "status": "starting", "started_at": round(t, 3),
                "reject_percent": reject, **kn, "max_workers": max_workers}
-    ddb.put_item(TableName=RUNS_TABLE, Item=to_ddb(summary))
-    lam.invoke(FunctionName=os.environ["AWS_LAMBDA_FUNCTION_NAME"], InvocationType="Event",
-               Payload=json.dumps({"internal": "start_run", **summary}).encode())
+    if not acquire_lock(summary, t):
+        results(force=True)                     # completes the current run if it is done
+        if not acquire_lock(summary, now()):
+            raise HttpError(409, "a run is already in progress; wait for it to finish or POST /reset")
+    try:
+        lam.invoke(FunctionName=os.environ["AWS_LAMBDA_FUNCTION_NAME"], InvocationType="Event",
+                   Payload=json.dumps({"internal": "start_run", **summary}).encode())
+    except Exception as e:
+        rollback(run_id, sk, f"could not start the run: {type(e).__name__}")
+        raise HttpError(503, "could not start the run; it was rolled back, try again")
     _cache.clear()
     return {"run_id": run_id, "status": "starting", "reject_percent": reject, **kn,
             "workers": f"autoscaled by SQS, up to {max_workers}"}
 
 
-def set_run_status(run_id, sk, status, **extra):
-    ddb.update_item(
-        TableName=RUNS_TABLE, Key=to_ddb({"pk": "RUN", "sk": sk}),
-        UpdateExpression="SET #st = :s" + "".join(f", #{k} = :{k}" for k in extra),
-        ExpressionAttributeNames={"#st": "status", **{f"#{k}": k for k in extra}},
-        ExpressionAttributeValues=to_ddb({":s": status, **{f":{k}": v for k, v in extra.items()}}))
+def set_run_status(run_id, sk, status, expect=None, **extra):
+    """
+    Move a run to a new status: its summary and the lock change together in one transaction.
+    With expect, only from those statuses; returns False if another caller got there first
+    (e.g. two /results calls both noticing the run is done), so side effects run only once.
+    """
+    names = {"#st": "status", **{f"#{k}": k for k in extra}}
+    values = {":s": status, **{f":{k}": v for k, v in extra.items()}}
+    summary = {"TableName": RUNS_TABLE, "Key": to_ddb({"pk": "RUN", "sk": sk}),
+               "UpdateExpression": "SET #st = :s" + "".join(f", #{k} = :{k}" for k in extra),
+               "ExpressionAttributeNames": names, "ExpressionAttributeValues": to_ddb(values)}
+    if expect:
+        summary["ConditionExpression"] = "#st IN (" + ", ".join(f":e{i}" for i in range(len(expect))) + ")"
+        summary["ExpressionAttributeValues"] = to_ddb({**values, **{f":e{i}": e for i, e in enumerate(expect)}})
+    lock = {"TableName": RUNS_TABLE, "Key": to_ddb(CONTROL_KEY), "UpdateExpression": "SET #st = :s",
+            "ConditionExpression": "run_id = :r", "ExpressionAttributeNames": {"#st": "status"},
+            "ExpressionAttributeValues": to_ddb({":s": status, ":r": run_id})}
     try:
-        ddb.update_item(
-            TableName=RUNS_TABLE, Key=to_ddb(CONTROL_KEY), UpdateExpression="SET #st = :s",
-            ConditionExpression="run_id = :r", ExpressionAttributeNames={"#st": "status"},
-            ExpressionAttributeValues=to_ddb({":s": status, ":r": run_id}))
-    except ddb.exceptions.ConditionalCheckFailedException:
-        pass                                   # a newer run (or a reset) owns the lock now
+        ddb.transact_write_items(TransactItems=[{"Update": summary}, {"Update": lock}])
+        return True
+    except ddb.exceptions.TransactionCanceledException as e:
+        reasons = [r.get("Code") for r in e.response.get("CancellationReasons", [])]
+        if reasons and reasons[0] == "ConditionalCheckFailed":
+            return False                        # someone else already moved this run on
+        # The lock belongs to a newer run or a reset: update just this run's summary.
+        try:
+            ddb.update_item(**summary)
+            return True
+        except ddb.exceptions.ConditionalCheckFailedException:
+            return False
+
+
+def rollback(run_id, sk, reason):
+    """A run that failed to start cleanly: mark it failed, stop the workers, drop its messages."""
+    print(dumps({"rollback": run_id, "reason": reason}))
+    if not set_run_status(run_id, sk, "failed", expect=["starting", "running"], error=reason):
+        return False
+    ctl = from_ddb(ddb.get_item(TableName=RUNS_TABLE, Key=to_ddb(CONTROL_KEY)).get("Item"))
+    if ctl.get("run_id") == run_id:             # only touch shared infra if no newer run owns it
+        set_esms(False)
+        for q in (REBOOKING_QUEUE, REROUTING_QUEUE):
+            try:
+                sqs.purge_queue(QueueUrl=q)
+            except sqs.exceptions.PurgeQueueInProgress:
+                pass
+    _cache.clear()
+    return True
 
 
 def run_async(ev):
-    """Second half of /run, invoked asynchronously so the HTTP call returns right away."""
+    """Second half of /run, invoked asynchronously. Any failure rolls the run back."""
+    try:
+        return _run_async(ev)
+    except Exception as e:
+        rollback(ev["run_id"], ev["sk"], f"run start failed: {type(e).__name__}: {e}"[:300])
+        return {"run_id": ev["run_id"], "status": "failed"}
+
+
+def _run_async(ev):
     run_id, sk = ev["run_id"], ev["sk"]
     esm = set_esms(True)                       # takes a few seconds to apply; overlaps record prep
     pacer = WcuPacer(pace_rate(os.environ.get("RUN_INIT_WCU_PER_SEC")))
@@ -241,12 +300,8 @@ def run_async(ev):
         except ddb.exceptions.ConditionalCheckFailedException:
             pacer.record(1)
     if not cases:
-        set_run_status(run_id, sk, "failed", error="no customer records found; POST /load first")
-        set_esms(False)
+        rollback(run_id, sk, "no customer records found; POST /load first")
         return {"run_id": run_id, "status": "failed"}
-
-    queued_at = round(now(), 3)
-    set_run_status(run_id, sk, "running", records=len(cases), queued_at=queued_at, worker_mappings=esm)
 
     # Faults travel on the messages. Each producer stamps its own messages from the same
     # deterministic draws per (run, case, pass): here pass 1, in the worker every later pass.
@@ -259,6 +314,11 @@ def run_async(ev):
         ddb.update_item(TableName=RUNS_TABLE, Key=to_ddb({"pk": f"RUN#{run_id}", "sk": "EVENTS"}),
                         UpdateExpression="ADD duplicates_sent :n",
                         ExpressionAttributeValues=to_ddb({":n": len(entries) - len(cases)}))
+    # Only now is the run "running": if this function died while sending, the run is still
+    # "starting", and housekeeping rolls it back after START_TIMEOUT_S.
+    if not set_run_status(run_id, sk, "running", expect=["starting"], records=len(cases),
+                          queued_at=round(now(), 3), worker_mappings=esm):
+        return {"run_id": run_id, "status": "superseded"}
     print(dumps({"run_id": run_id, "records": len(cases), "messages": len(entries), **kn, "esm": esm}))
     return {"run_id": run_id, "records": len(cases)}
 
@@ -428,6 +488,34 @@ def attribute_kills(kills, rows):
     return out
 
 
+EVENT_COUNTERS = ("fenced", "repaired", "stale", "deferred", "duplicates_sent", "throttles_injected",
+                  "sdk_retries", "failed_throttled", "failed_poison", "failed_injected", "failed_error", "backoffs",
+                  "own_write_recognized")
+
+
+def incidents(start, rows, kills, zombies, sweeps, limit=60):
+    """Everything that went wrong and how it was handled, newest first, for the incident feed."""
+    out = []
+    for k in kills:
+        out.append({"t": float(k["killed_at"]), "kind": "crash", "worker": k["worker"], "case_id": k["case_id"],
+                    "pass": int(k.get("pass", 1)), "point": k["point"], "mode": k.get("mode"),
+                    "recovered": k.get("recovered"), "recovered_by": k.get("recovered_by")})
+    for r in rows:
+        for h in r.get("history", []):
+            if h.get("from") and "c" in h:
+                out.append({"t": float(h["c"]), "kind": "takeover", "worker": h["w"], "from": h["from"],
+                            "case_id": r[KEY], "pass": int(h["p"])})
+    for z in zombies:
+        out.append({"t": float(z["woke_at"]), "kind": "zombie", "worker": z["worker"], "case_id": z["case_id"],
+                    "pass": int(z["pass"]), "outcome": z.get("outcome"), "rival": z.get("taken_over_by")})
+    for w in sweeps:
+        out.append({"t": float(w["swept_at"]), "kind": "swept", "case_id": w["case_id"], "pass": int(w["pass"]),
+                    "deliveries": int(w.get("deliveries", 0))})
+    for e in out:
+        e["at_s"] = round(e.pop("t") - start, 1)
+    return sorted(out, key=lambda e: e["at_s"], reverse=True)[:limit]
+
+
 def race_results(run_items, rows, events):
     """Slow-worker and duplicate-delivery outcomes, and the invariant duplicates must never break."""
     zombies = [i for i in run_items if i["sk"].startswith("ZOMBIE#")]
@@ -485,6 +573,7 @@ def results(force=False):
         TableName=RUNS_TABLE, KeyConditionExpression="pk = :p",
         ExpressionAttributeValues=to_ddb({":p": f"RUN#{run_id}"}))["Items"]]
     kills = [normalize_kill(i) for i in run_items if i["sk"].startswith("KILL#")]
+    sweeps = sorted((i for i in run_items if i["sk"].startswith("SWEEP#")), key=lambda i: float(i["swept_at"]))
     events = next((i for i in run_items if i["sk"] == "EVENTS"), {})
     gold = golden()
 
@@ -510,7 +599,8 @@ def results(force=False):
             "lease_owner": r.get("lease_owner"), "satisfactory": ok, "unacceptable_offered": bad,
             "urgency": r.get("urgency"), "cabin": r.get("cabin"), "destination": r.get("destination"),
             "party_size": r.get("party_size"), "travel_concerns": r.get("travel_concerns"),
-            "queued_at": r.get("queued_at"), "resolved_at": r.get("resolved_at"),
+            "queued_at": r.get("queued_at"), "resolved_at": r.get("resolved_at"), "swept": bool(r.get("swept")),
+            "history": [{k: h.get(k) for k in ("p", "o", "r", "w", "c", "t", "from")} for h in hist],
             "crashes_here": sum(1 for k in kills if k["case_id"] == r[KEY]),
         })
 
@@ -542,8 +632,18 @@ def results(force=False):
         "takeovers_after_crash": takeovers,
         "kills_fired": len(fired), "kills_recovered": sum(1 for k in fired if k["recovered"]),
         "kills_by_point": kills_by_point(fired),
-        "events": {k: int(events.get(k, 0)) for k in ("fenced", "repaired", "stale", "deferred", "duplicates_sent")},
+        "events": {k: int(events.get(k, 0)) for k in EVENT_COUNTERS},
         "races": race_results(run_items, rows, events),
+        "degradation": {
+            "throttles_injected": int(events.get("throttles_injected", 0)),
+            "sdk_retries": int(events.get("sdk_retries", 0)),
+            "throttled_after_retries": int(events.get("failed_throttled", 0)),
+            "message_backoffs": int(events.get("backoffs", 0)),
+            "poison_failures": int(events.get("failed_poison", 0)),
+            "other_errors": int(events.get("failed_error", 0)),
+            "own_writes_recognized": int(events.get("own_write_recognized", 0)),
+            "dead_lettered_swept": len(sweeps),
+        },
         "workers_busy_now": activity["busy_now"], "workers_peak": activity["peak"],
         "workers_used": activity["used"], "first_claim_s": activity["first_claim_s"],
         "queued_s": round(float(run["queued_at"]) - started, 1) if run.get("queued_at") else None,
@@ -552,36 +652,55 @@ def results(force=False):
     status = run["status"]
     if status in ACTIVE and complete:
         status = "complete"
-        set_run_status(run_id, run["sk"], "complete", finished_at=round(finished_at, 3),
-                       final=json.loads(dumps(stats)))
+        won = set_run_status(run_id, run["sk"], "complete", expect=list(ACTIVE),
+                             finished_at=round(finished_at, 3), final=json.loads(dumps(stats)))
         run.update(status="complete", finished_at=finished_at)
-        try:
-            set_esms(False)                     # idle mappings would keep polling SQS
-        except Exception as e:                  # housekeeping retries
-            print(f"could not disable worker mappings: {e!r}")
-    elif status == "running" and open_rows and t - last_activity > STALL_S:
+        if won:                                 # exactly one caller switches the workers off
+            try:
+                set_esms(False)                 # idle mappings would keep polling SQS
+            except Exception as e:              # housekeeping retries
+                print(f"could not disable worker mappings: {e!r}")
+    elif (status == "running" and open_rows and t - last_activity > STALL_S
+          and not any(q["visible"] + q["in_flight"] for q in out["queues"].values())):
         status = "stalled"                      # open records but nothing happening: shown, not hidden
     out["latest_run"] = {**run, "status": status, "stats": stats, "workers": activity["workers"],
+                         "incidents": incidents(started, rows, fired, stats["races"]["zombie_list"], sweeps),
+                         "sweeps": sweeps,
                          "timeline": activity["timeline"], "kills": fired, "records": table}
     _cache.update(t=t, v=out)
     return out
 
 
 def housekeeping():
-    """Every few minutes: finish a run nobody is watching, and never leave mappings polling idle."""
+    """Every few minutes: finish or roll back unwatched runs; never leave mappings polling idle."""
+    try:
+        return _housekeeping()
+    except Exception as e:                      # log loudly; the next tick tries again
+        print(dumps({"housekeeping": "failed", "error": f"{type(e).__name__}: {e}"[:300]}))
+        return {"error": type(e).__name__}
+
+
+def _housekeeping():
     ctl = from_ddb(ddb.get_item(TableName=RUNS_TABLE, Key=to_ddb(CONTROL_KEY)).get("Item"))
-    active = ctl.get("status") in ACTIVE and float(ctl.get("expires_at", 0)) > now()
-    if active:
-        results(force=True)
-        ctl = from_ddb(ddb.get_item(TableName=RUNS_TABLE, Key=to_ddb(CONTROL_KEY)).get("Item"))
-        active = ctl.get("status") in ACTIVE
+    t = now()
+    rolled_back = None
+    if ctl.get("status") == "starting" and t - float(ctl.get("started_at", t)) > START_TIMEOUT_S:
+        rolled_back = ctl["run_id"]
+        rollback(ctl["run_id"], ctl["summary_sk"], "run start did not finish (control function died?)")
+    elif ctl.get("status") in ACTIVE and float(ctl.get("expires_at", 0)) < t:
+        rolled_back = ctl["run_id"]
+        rollback(ctl["run_id"], ctl["summary_sk"], "run lock expired before the run finished")
+    elif ctl.get("status") in ACTIVE:
+        results(force=True)                     # completes it if every record is done
+    ctl = from_ddb(ddb.get_item(TableName=RUNS_TABLE, Key=to_ddb(CONTROL_KEY)).get("Item"))
+    active = ctl.get("status") in ACTIVE
     states = {k: v["state"] for k, v in esm_states().items()}
     changed = None
     if not active and any(s not in ("Disabled", "Disabling") for s in states.values()):
         changed = set_esms(False)
     print(dumps({"housekeeping": True, "active_run": ctl.get("run_id") if active else None,
-                 "mappings": states, "disabled": changed}))
-    return {"active_run": active, "mappings": states, "disabled": changed}
+                 "rolled_back": rolled_back, "mappings": states, "disabled": changed}))
+    return {"active_run": active, "rolled_back": rolled_back, "mappings": states, "disabled": changed}
 
 
 # --- entry points ------------------------------------------------------------

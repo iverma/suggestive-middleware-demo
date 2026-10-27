@@ -38,10 +38,27 @@ NUMERIC = {
 }
 TERMINAL = {"resolved", "human_review"}
 
-_cfg = Config(retries={"mode": "standard", "max_attempts": 10})
+# Throttling and transient errors are retried inside the SDK with exponential backoff and full
+# jitter ("standard" mode: sleep random(0, 1) * 2^attempt, capped). Workers get 3 retries (worst
+# case ~7s of sleeping) and short timeouts, so a retry storm can never outlive the 20s invoke
+# while holding a 15s lease; past that, the message itself backs off exponentially (see
+# worker.backoff_seconds). "adaptive" mode was tried and rejected: its client-side rate limiter
+# outlives the burst in a warm worker and slows every later record unpredictably.
+# The control function serves people and can afford to retry longer.
+WORKER_CFG = Config(retries={"mode": "standard", "max_attempts": 3}, connect_timeout=2, read_timeout=5)
+CONTROL_CFG = Config(retries={"mode": "standard", "max_attempts": 6}, connect_timeout=3, read_timeout=20)
+_cfg = WORKER_CFG if os.environ.get("ROLE") == "worker" else CONTROL_CFG
 ddb = boto3.client("dynamodb", config=_cfg)
 sqs = boto3.client("sqs", config=_cfg)
 lam = boto3.client("lambda", config=_cfg)
+
+THROTTLE_CODES = {"ProvisionedThroughputExceededException", "ThrottlingException", "Throttling",
+                  "RequestThrottled", "RequestLimitExceeded", "TooManyRequestsException",
+                  "RequestThrottledException", "LimitExceededException"}
+
+
+def is_throttle(exc):
+    return getattr(exc, "response", {}).get("Error", {}).get("Code") in THROTTLE_CODES
 
 _ser, _deser = TypeSerializer(), TypeDeserializer()
 
@@ -262,9 +279,17 @@ def race_plan(run_id, case_id, pass_no, slow_percent=0, dup_percent=0):
     return stall, dup
 
 
+FAULT_KNOBS = ("kill_percent", "slow_percent", "dup_percent", "poison_percent", "throttle_percent")
+
+
 def knobs(ctl):
     """The fault settings of a run, as stored on its control item."""
-    return {k: ctl.get(k, 0) for k in ("kill_percent", "slow_percent", "dup_percent")}
+    return {k: ctl.get(k, 0) for k in FAULT_KNOBS}
+
+
+def poison_plan(run_id, case_id, pass_no, poison_percent=0):
+    """A poison message fails on every delivery (bad data, a bug): it can only end in the DLQ."""
+    return bool(poison_percent) and (_h("poison?", run_id, case_id, pass_no) % 10000) / 100.0 < float(poison_percent)
 
 
 def outgoing(run_id, case_id, pass_no, kn):
@@ -283,6 +308,8 @@ def outgoing(run_id, case_id, pass_no, kn):
         body["stall"] = stall
     if dup:
         body["dup"] = True
+    if poison_plan(run_id, case_id, pass_no, kn.get("poison_percent", 0)):
+        body["poison"] = True
     text = json.dumps(body)
     return [text, text] if dup else [text]
 

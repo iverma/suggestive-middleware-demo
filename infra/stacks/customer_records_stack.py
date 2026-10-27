@@ -19,7 +19,7 @@ ROOT = Path(__file__).resolve().parents[2]
 CSV = ROOT / "golden_set" / "golden_set_irops_msp.csv"
 SRC = ROOT / "infra" / "experiment_control"
 BUILD = ROOT / "infra" / ".build" / "experiment_control"
-RUNTIME_FILES = ["common.py", "handler.py", "worker.py", "ui.html"]
+RUNTIME_FILES = ["common.py", "handler.py", "worker.py", "sweeper.py", "throttle.py", "ui.html"]
 
 # Free tier: 25 provisioned RCU + 25 provisioned WCU per account, across ALL tables.
 # Provisioned capacity is what's billed, so these numbers ARE the cost ceiling: no
@@ -43,6 +43,10 @@ VISIBILITY_SECONDS = 20
 REBOOKING_MAX_WORKERS = 5
 REROUTING_MAX_WORKERS = 3
 CONTROL_FN = "effect-demo-experiment-control"
+SWEEPER_FN = "effect-demo-sweeper"
+# Deliveries before a message is dead-lettered (crashes, held-back duplicates and backoffs all
+# count). 5 x 20s visibility puts a poison message in the DLQ within ~2 minutes.
+MAX_RECEIVES = 5
 WORKER_FN = "effect-demo-worker"
 
 
@@ -83,7 +87,7 @@ class CustomerRecordsStack(Stack):
         # SQS: 1M requests/month always free. Queue-managed encryption is free.
         dlq = sqs.Queue(self, "DeadLetter", queue_name="effect-demo-dead-letter",
                         retention_period=Duration.days(1), encryption=sqs.QueueEncryption.SQS_MANAGED)
-        redrive = sqs.DeadLetterQueue(queue=dlq, max_receive_count=10)
+        redrive = sqs.DeadLetterQueue(queue=dlq, max_receive_count=MAX_RECEIVES)
         queue_props = dict(visibility_timeout=Duration.seconds(VISIBILITY_SECONDS),
                            retention_period=Duration.hours(1), dead_letter_queue=redrive,
                            encryption=sqs.QueueEncryption.SQS_MANAGED)
@@ -119,7 +123,8 @@ class CustomerRecordsStack(Stack):
             return f
 
         worker = fn("Worker", WORKER_FN, "worker.handler", Duration.seconds(WORKER_TIMEOUT_S),
-                    "Re-booking worker: invoked by SQS, claims records with fencing tokens", env)
+                    "Re-booking worker: invoked by SQS, claims records with fencing tokens",
+                    {**env, "ROLE": "worker"})
 
         # Lambda autoscales the workers from queue depth, one message per invoke. Created switched
         # OFF: an enabled mapping long-polls its queue around the clock (~650k SQS requests/month
@@ -145,6 +150,27 @@ class CustomerRecordsStack(Stack):
         control.add_to_role_policy(iam.PolicyStatement(
             actions=["lambda:InvokeFunction"],
             resources=[f"arn:{self.partition}:lambda:{self.region}:{self.account}:function:{CONTROL_FN}"]))
+
+        # Dead-letter sweeper: separate control-plane function with its own narrow role. Every
+        # minute it routes records whose message was dead-lettered to HUMAN_REVIEW (fenced write).
+        sweeper_logs = logs.LogGroup(self, "SweeperLogs", log_group_name=f"/aws/lambda/{SWEEPER_FN}",
+                                     retention=logs.RetentionDays.ONE_WEEK, removal_policy=RemovalPolicy.DESTROY)
+        sweeper = lambda_.Function(
+            self, "Sweeper", function_name=SWEEPER_FN,
+            description="Routes dead-lettered records to HUMAN_REVIEW with a fenced write",
+            runtime=lambda_.Runtime.PYTHON_3_12, architecture=lambda_.Architecture.ARM_64,
+            handler="sweeper.handler", code=code, memory_size=256, timeout=Duration.seconds(60),
+            environment=env, log_group=sweeper_logs, retry_attempts=0,
+        )
+        dlq.grant_consume_messages(sweeper)
+        records.grant_read_write_data(sweeper)
+        runs.grant_write_data(sweeper)
+        scheduler.Schedule(
+            self, "SweepDeadLetters", schedule_name="effect-demo-sweep-dead-letters",
+            schedule=scheduler.ScheduleExpression.rate(Duration.minutes(1)),
+            target=scheduler_targets.LambdaInvoke(sweeper, retry_attempts=0),
+            description="Route dead-lettered records to a person (~43k invocations/month of 14M free)",
+        )
 
         # Safety net: every 5 minutes, finish runs nobody is watching and switch idle mappings off.
         # EventBridge Scheduler: 14M invocations/month free; this uses ~8,600.
@@ -176,6 +202,7 @@ class CustomerRecordsStack(Stack):
         CfnOutput(self, "ExperimentControlFunction", value=control.function_name)
         CfnOutput(self, "ExperimentControlArn", value=control.function_arn)
         CfnOutput(self, "WorkerFunction", value=worker.function_name)
+        CfnOutput(self, "SweeperFunction", value=sweeper.function_name)
         CfnOutput(self, "MaxWorkers", value=str(REBOOKING_MAX_WORKERS + REROUTING_MAX_WORKERS))
         CfnOutput(self, "RecordsLoaded", value=load.get_att_string("Loaded"))
         CfnOutput(self, "LoadWcuConsumed", value=load.get_att_string("WcuConsumed"))

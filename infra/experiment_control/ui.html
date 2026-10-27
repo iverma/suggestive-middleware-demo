@@ -64,6 +64,9 @@
   .tile.takeover::after { content: ""; position: absolute; bottom: 5px; right: 5px; width: 9px; height: 9px;
           border-radius: 50%; background: #fff; box-shadow: 0 0 0 2px var(--bad); }
   .tile.unsat { box-shadow: inset 0 -4px 0 var(--bad); }
+  .tile.crashed::before { content: ""; position: absolute; top: 0; left: 0; border-style: solid;
+          border-width: 10px 10px 0 0; border-color: var(--bad) transparent transparent transparent; border-top-left-radius: 3px; }
+  .tile.swept { outline: 2px dashed var(--ink); outline-offset: -4px; }
   @media (prefers-reduced-motion: reduce) { .tile { transition: none; } }
   @media (max-width: 640px) {
     .board { gap: 3px; }
@@ -122,6 +125,13 @@
   #detail { background: var(--panel); border-left: 4px solid var(--ink); padding: 12px 14px; margin-top: 14px; }
   #detail[hidden] { display: none; }
   #detail ol { margin: 6px 0 0; padding-left: 22px; }
+  .feed { list-style: none; margin: 0; padding: 0; max-height: 360px; overflow-y: auto; border-top: 1px solid var(--line); }
+  .feed li { display: grid; grid-template-columns: 56px 1fr; gap: 10px; padding: 7px 4px; border-bottom: 1px solid var(--line); font-size: .92rem; }
+  .feed .at { font-variant-numeric: tabular-nums; color: var(--muted); }
+  .feed .k-crash .what { color: var(--bad); font-weight: 700; }
+  .feed .k-takeover .what, .feed .k-swept .what { color: var(--resolved); font-weight: 700; }
+  .feed .k-zombie .what { color: var(--human); font-weight: 700; }
+  .feed button.case { font: inherit; padding: 0; border: 0; background: none; color: var(--focus); text-decoration: underline; cursor: pointer; }
 </style>
 </head>
 <body>
@@ -136,6 +146,8 @@
       <label>Crash % <input type="number" id="kill" min="0" max="50" value="0"></label>
       <label>Slow % <input type="number" id="slow" min="0" max="20" value="0"></label>
       <label>Duplicate % <input type="number" id="dup" min="0" max="100" value="0"></label>
+      <label>Poison % <input type="number" id="poison" min="0" max="10" value="0"></label>
+      <label>Throttle % <input type="number" id="throttle" min="0" max="30" value="0"></label>
       <button type="submit" class="primary" id="btn-run">Start run</button>
       <button type="button" id="btn-load">Load records</button>
       <button type="button" id="btn-reset">Reset</button>
@@ -152,7 +164,9 @@
         <span><i style="background:var(--resolved)"></i>Accepted an offer</span>
         <span><i style="background:var(--human)"></i>Sent to a person</span>
         <span class="ft-key">ft: fencing token</span>
+        <span>Red corner: a worker crashed on this record</span>
         <span>White dot: picked up after a worker died</span>
+        <span>Dashed outline: dead-lettered, swept to a person</span>
         <span>Red underline: outcome outside the golden set</span>
       </div>
       <div id="detail" hidden></div>
@@ -169,6 +183,18 @@
       <svg id="chart-svg" role="img" aria-label="Busy workers per second during the latest run"></svg>
       <div class="tip" id="tip" hidden></div>
     </div>
+  </section>
+
+  <section>
+    <h2>What went wrong, and what handled it</h2>
+    <p class="empty-note" style="margin:-4px 0 10px">Newest first. Every injected failure in the latest run, and the mechanism that recovered from it.</p>
+    <ol class="feed" id="feed"></ol>
+  </section>
+
+  <section>
+    <h2>Degraded dependencies</h2>
+    <p class="empty-note" style="margin:-4px 0 10px">Throttled AWS calls and messages that can never succeed. Retries and backoff should absorb throttling; poison should end with a person, not stuck.</p>
+    <div class="scroll"><table id="degrade-t"></table></div>
   </section>
 
   <section>
@@ -228,7 +254,7 @@ async function call(path, label) {
     const r = await fetch(path, { method: "POST" });
     const body = await r.json();
     if (!r.ok) throw new Error(body.error || r.statusText);
-    if (path.startsWith("/run")) say(`Run ${body.run_id} started: ${body.reject_percent}% rejections; ${body.kill_percent}% of worker passes crash, ${body.slow_percent}% run slow, ${body.dup_percent}% are delivered twice; workers ${body.workers}.`);
+    if (path.startsWith("/run")) say(`Run ${body.run_id} started: ${body.reject_percent}% rejections; ${body.kill_percent}% of worker passes crash, ${body.slow_percent}% run slow, ${body.dup_percent}% are delivered twice, ${body.poison_percent}% are poison, ${body.throttle_percent}% of AWS calls are throttled; workers ${body.workers}.`);
     else if (path === "/load") say(`Loaded ${body.loaded} records in ${body.seconds}s (${body.wcu_per_sec_actual} write units/s).`);
     else say(`Reset: deleted ${body.deleted_records} records and ${body.deleted_run_items} run items. Workers switched off.`);
   } catch (e) { say(`${label} failed: ${e.message}`, true); }
@@ -238,7 +264,8 @@ async function call(path, label) {
 $("controls").addEventListener("submit", (e) => {
   e.preventDefault();
   const q = new URLSearchParams({ reject_percent: $("reject").value, kill_percent: $("kill").value,
-                                 slow_percent: $("slow").value, dup_percent: $("dup").value });
+                                 slow_percent: $("slow").value, dup_percent: $("dup").value,
+                                 poison_percent: $("poison").value, throttle_percent: $("throttle").value });
   call(`/run?${q}`, "Starting run");
 });
 $("btn-load").onclick = () => call("/load", "Loading records");
@@ -263,7 +290,8 @@ function renderBoard(run, total) {
   const cells = recs.length ? recs : Array.from({ length: Math.max(total, 100) }, () => null);
   $("board").innerHTML = cells.map((r) => {
     if (!r) return `<div class="tile empty"><span class="id">–</span></div>`;
-    const cls = [r.status, r.takeovers ? "takeover" : "", (r.status === "resolved" && !r.satisfactory) ? "unsat" : ""].join(" ");
+    const cls = [r.status, r.takeovers ? "takeover" : "", (r.status === "resolved" && !r.satisfactory) ? "unsat" : "",
+                 r.crashes_here ? "crashed" : "", r.swept ? "swept" : ""].join(" ");
     return `<button class="tile ${cls}" data-id="${esc(r.case_id)}" title="${esc(r.case_id)}: ${esc(r.status)}, pass ${r.pass_no}, fencing token ${r.fencing_token}">
       <span class="top"><span class="id">${r.case_id.slice(-3)}</span><span class="ft">ft ${r.fencing_token ?? 0}</span></span><span class="p">pass ${r.pass_no ?? "–"}</span></button>`;
   }).join("");
@@ -275,9 +303,20 @@ function renderDetail() {
   const r = run && run.records.find(x => x.case_id === selected);
   if (!r) { $("detail").hidden = true; return; }
   $("detail").hidden = false;
+  const steps = [];
+  (r.history || []).forEach(h => {
+    if (h.w === "sweeper") { steps.push([h.c, `Pass ${h.p}: dead-lettered; the sweeper sent it to human review`]); return; }
+    steps.push([h.c, `Pass ${h.p}: ${esc(h.w)} claimed it${h.from ? ` (took over from ${esc(h.from)})` : ""}`]);
+    steps.push([h.t, `Pass ${h.p}: offered ${esc(h.o)}, customer ${h.r === "reject" ? "rejected it" : h.r === "accept" ? "accepted" : "sent to a person"}`]);
+  });
+  (run.kills || []).filter(k => k.case_id === r.case_id).forEach(k =>
+    steps.push([k.killed_at, `Pass ${k.pass}: ${esc(k.worker)} ${k.mode === "timeout" ? "hung past its timeout" : k.mode === "raise" ? "threw" : "crashed"} at ${esc(POINT_LABEL[k.point] || k.point)}`]));
+  (run.stats.races.zombie_list || []).filter(z => z.case_id === r.case_id).forEach(z =>
+    steps.push([z.woke_at, `Pass ${z.pass}: ${esc(z.worker)} woke past its lease; ${z.outcome === "fenced" ? "its write was fenced off" : "nobody had taken over, its write stood"}`]));
+  steps.sort((a, b) => a[0] - b[0]);
   $("detail").innerHTML = `<strong>${esc(r.case_id)}</strong> to ${esc(r.destination)}, ${esc(r.cabin)}, party of ${r.party_size}, ${esc(r.urgency)}${r.travel_concerns !== "none" ? ", " + esc(r.travel_concerns) : ""}.
-    Fencing token ${r.fencing_token}, claimed ${r.claims ?? 0} times this run${r.lease_owner ? `, held by ${esc(r.lease_owner)}` : ""}${r.crashes_here ? `. ${r.crashes_here} injected crash${r.crashes_here > 1 ? "es" : ""} on this record` : ""}.
-    <ol>${r.offers.map(o => { const [off, res] = o.split(":"); return `<li>${esc(off)}: ${esc(res)}</li>`; }).join("") || "<li>No offers yet</li>"}</ol>`;
+    Fencing token ${r.fencing_token}, claimed ${r.claims ?? 0} times this run${r.lease_owner ? `, held by ${esc(r.lease_owner)}` : ""}.
+    <ol>${steps.map(([t, txt]) => `<li><span class="offers">${mmss(Math.max(0, t - run.started_at))}</span> ${txt}</li>`).join("") || "<li>Waiting for a worker</li>"}</ol>`;
 }
 
 // --- run box -------------------------------------------------------------------
@@ -307,7 +346,7 @@ function renderRunbox(run, maps) {
       <dt>Lost handoffs repaired</dt><dd>${s.events.repaired}</dd>
       <dt>Late writes fenced off</dt><dd>${s.events.fenced}</dd>
     </dl>
-    <p class="empty-note" style="margin-top:10px">${esc(run.run_id)}: ${run.reject_percent}% rejections; ${run.kill_percent ?? 0}% crash, ${run.slow_percent ?? 0}% slow, ${run.dup_percent ?? 0}% duplicated.</p>`;
+    <p class="empty-note" style="margin-top:10px">${esc(run.run_id)}: ${run.reject_percent}% rejections; ${run.kill_percent ?? 0}% crash, ${run.slow_percent ?? 0}% slow, ${run.dup_percent ?? 0}% duplicated, ${run.poison_percent ?? 0}% poison, ${run.throttle_percent ?? 0}% throttled.</p>`;
 }
 
 // --- workers-over-time chart ---------------------------------------------------
@@ -390,6 +429,40 @@ const POINT_LABEL = {
   after_final_commit_before_ack: "K8 Final outcome saved, message not acknowledged",
   stalled_past_timeout: "Slow worker: hung past the function timeout",
 };
+function caseLink(id) { return `<button class="case" data-case="${esc(id)}">${esc(id)}</button>`; }
+function renderFeed(run) {
+  const items = run ? run.incidents || [] : [];
+  if (!items.length) { $("feed").innerHTML = `<li><span></span><span class="empty-note">Nothing has gone wrong yet. Set Crash %, Slow %, Duplicate %, Poison % or Throttle % above 0 to make it.</span></li>`; return; }
+  const line = (e) => {
+    const where = `${caseLink(e.case_id)} pass ${e.pass}`;
+    if (e.kind === "crash") return [`${e.mode === "timeout" ? "Hung past its timeout" : e.mode === "raise" ? "Threw an exception" : "Crashed"}`,
+      `${esc(e.worker)} at ${esc(POINT_LABEL[e.point] || e.point)}, holding ${where}. ${e.recovered ? `Recovered by ${esc(e.recovered_by)}.` : "Not recovered yet."}`];
+    if (e.kind === "takeover") return ["Took over", `${esc(e.worker)} picked up ${where} after ${esc(e.from)}'s lease ran out.`];
+    if (e.kind === "zombie") return [e.outcome === "fenced" ? "Zombie fenced off" : "Late, uncontested",
+      e.outcome === "fenced" ? `${esc(e.worker)} woke up past its lease on ${where} and tried to save; ${esc(e.rival || "another worker")} had taken over, so the write was refused.`
+                             : `${esc(e.worker)} saved ${where} after its lease ran out; nobody had taken over, so its result stands.`];
+    if (e.kind === "swept") return ["Swept to a person", `${where} failed all ${e.deliveries} deliveries and was dead-lettered; the sweeper sent it to human review.`];
+    return [e.kind, where];
+  };
+  $("feed").innerHTML = items.map(e => { const [what, detail] = line(e);
+    return `<li class="k-${e.kind}"><span class="at">${mmss(Math.max(0, e.at_s))}</span><span><span class="what">${what}.</span> ${detail}</span></li>`; }).join("");
+  $("feed").querySelectorAll("button.case").forEach(b => b.onclick = () => { selected = b.dataset.case; renderDetail(); $("detail").scrollIntoView({ block: "nearest" }); });
+}
+
+function renderDegradation(run) {
+  const d = run && run.stats.degradation;
+  if (!d) { $("degrade-t").innerHTML = `<tr><td class="empty-note">Appears once a run starts.</td></tr>`; return; }
+  const row = (what, n, detail) => `<tr><td>${what}</td><td class="n">${n}</td><td>${detail}</td></tr>`;
+  $("degrade-t").innerHTML = `<tr><th>What happened</th><th class="n">Count</th><th>What it shows</th></tr>` +
+    row("AWS calls throttled (HTTP 400)", d.throttles_injected, "Injected into the SDK's HTTP layer, as DynamoDB or SQS would answer when over capacity") +
+    row("SDK retries", d.sdk_retries, "Exponential backoff with jitter, inside the call; most throttles end here") +
+    row("Still throttled after retries", d.throttled_after_retries, "The message itself backed off exponentially (20s, 40s, 80s…) instead of hammering") +
+    row("Poison deliveries", d.poison_failures, "Messages that fail every time, retried until the dead-letter queue takes them") +
+    row("Other errors caught", d.other_errors, "Unexpected exceptions, logged and retried by the catch-all") +
+    row("Own writes recognized", d.own_writes_recognized ?? 0, "A write landed but its response was lost; the retry saw its own result and carried on") +
+    row("Dead-lettered, swept to a person", d.dead_lettered_swept, "The sweeper routed each record to human review with a fenced write");
+}
+
 function renderRaces(run) {
   const r = run && run.stats.races;
   if (!r) { $("race-t").innerHTML = `<tr><td class="empty-note">Set Slow % or Duplicate % above 0 to race workers.</td></tr>`; return; }
@@ -479,7 +552,7 @@ async function refresh() {
     const run = data.latest_run;
     renderBoard(run, data.records_in_table); renderRunbox(run, data.worker_mappings);
     renderChart(run, data.worker_mappings); renderPasses(run); renderQueues(data.queues, data.worker_mappings);
-    renderWorkers(run); renderCrashes(run); renderRaces(run); renderRuns(data.recent_runs || []); renderRecords(run); renderDetail(); tick();
+    renderWorkers(run); renderFeed(run); renderDegradation(run); renderCrashes(run); renderRaces(run); renderRuns(data.recent_runs || []); renderRecords(run); renderDetail(); tick();
     if (!run && !busy) say(data.records_in_table ? `${data.records_in_table} records loaded. Start a run.` : "No records loaded. Load records to begin.");
   } catch (e) { say(`Couldn't read results: ${e.message}`, true); }
   const live = data && data.latest_run && ACTIVE.includes(data.latest_run.status);
