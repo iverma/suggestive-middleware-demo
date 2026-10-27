@@ -51,6 +51,14 @@ def main(base, reject="50", kill_percent="10", slow_percent="0", dup_percent="0"
         return 1
     time.sleep(8)                                    # let the mapping switch-off settle, then confirm it
     res = call(base, "GET", "/results")
+    # A duplicate copy of a poison message can reach the dead-letter queue after its record was
+    # already swept; the sweeper drops such stale copies on its next tick (every minute).
+    for _ in range(9):
+        if res["queues"]["dead_letter"]["visible"] + res["queues"]["dead_letter"]["in_flight"] == 0:
+            break
+        print("waiting for the sweeper to drain", res["queues"]["dead_letter"])
+        time.sleep(15)
+        res = call(base, "GET", "/results")
     maps = {k: v["state"] for k, v in res["worker_mappings"].items()}
     s = res["latest_run"]["stats"]
     print(json.dumps({"mappings_after": maps, "timeline_total": res["latest_run"]["timeline"]["total"]}))
