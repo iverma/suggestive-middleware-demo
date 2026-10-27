@@ -1,0 +1,31 @@
+name: AWS limits
+
+# Read-only: reports the Lambda concurrency quota so worker scaling can be sized to it.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: [".github/workflows/aws-limits.yml"]
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  limits:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - name: Lambda account settings (via the read-only CDK lookup role)
+        run: |
+          ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+          CREDS=$(aws sts assume-role --role-arn "arn:aws:iam::${ACCOUNT}:role/cdk-hnb659fds-lookup-role-${ACCOUNT}-${AWS_REGION}" \
+                  --role-session-name limits --query Credentials --output json)
+          export AWS_ACCESS_KEY_ID=$(echo "$CREDS" | jq -r .AccessKeyId)
+          export AWS_SECRET_ACCESS_KEY=$(echo "$CREDS" | jq -r .SecretAccessKey)
+          export AWS_SESSION_TOKEN=$(echo "$CREDS" | jq -r .SessionToken)
+          S=$(aws lambda get-account-settings --query '{limit:AccountLimit.ConcurrentExecutions,unreserved:AccountLimit.UnreservedConcurrentExecutions}' --output text)
+          echo "::notice title=Lambda concurrency (limit, unreserved)::$S"
