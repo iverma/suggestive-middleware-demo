@@ -28,9 +28,12 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: End-to-end tests (mocked DynamoDB + SQS, killed workers, zombie fencing)
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Tests (alarm wiring on the synthesized stack; mocked end to end with crashes and races)
         run: |
-          pip install -q boto3 "moto[dynamodb,sqs]" pytest
+          pip install -q boto3 "moto[dynamodb,sqs]" pytest -r infra/requirements.txt
           set +e
           python -m pytest infra/tests -q -p no:warnings -rf 2>&1 | tee pytest.log
           status=${PIPESTATUS[0]}

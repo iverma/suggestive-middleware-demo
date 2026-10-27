@@ -34,6 +34,7 @@ import urllib.request
 from datetime import datetime, timezone
 from decimal import Decimal
 
+import generator
 from analysis import (
     EVENT_COUNTERS, attribute_kills, incidents, kills_by_point, normalize_kill, race_results, score,
     worker_activity,
@@ -64,6 +65,18 @@ GOLDEN_READ_PER_SEC = 4.0 # read units/s spent copying the golden set (its table
 RESET_SETTLE_S = float(os.environ.get("RESET_SETTLE_S", "4"))
 ESM_RETRY_S = float(os.environ.get("ESM_RETRY_S", "45"))
 UI_PATH = os.path.join(os.path.dirname(__file__), "ui.html")
+
+# Load tests: generated unique records released at a rate that keeps experiment-runs under its
+# capacity alarm, never letting the rebooking backlog pass a cap, and handing the producer off
+# to a fresh invocation every LOAD_CHUNK_S seconds (a 1,000-record release outlasts one Lambda).
+LOAD_MAX_RECORDS = int(os.environ.get("LOAD_MAX_RECORDS", "1000"))
+LOAD_RECORDS_PER_SEC = float(os.environ.get("LOAD_RECORDS_PER_SEC", "2.0"))
+LOAD_BACKLOG_CAP = int(os.environ.get("LOAD_BACKLOG_CAP", "500"))
+LOAD_CHUNK_S = int(os.environ.get("LOAD_CHUNK_S", "540"))
+LOAD_BLOCK = 10                 # records created and enqueued per step (one SendMessageBatch)
+PRODUCER_STALE_S = 120          # no producer heartbeat for this long: housekeeping restarts it
+FINALIZE_READ_PER_SEC = 8.0     # read units/s spent scoring a finished load run
+FINALIZE_RETRY_S = 180          # a finished load run still unscored after this: score it again
 
 
 class HttpError(Exception):
@@ -313,22 +326,42 @@ def finish(run_id, status, **extra):
     won = transition(run_id, status, list(ACTIVE), finished_at=round(now(), 3), **extra)
     if won:
         safe_reconcile()
+        if get_meta(run_id).get("kind") == "load":
+            invoke_self({"internal": "finalize", "run_id": run_id})
     return won
+
+
+def invoke_self(payload):
+    lam.invoke(FunctionName=os.environ["AWS_LAMBDA_FUNCTION_NAME"], InvocationType="Event",
+               Payload=json.dumps(payload).encode())
 
 
 def start_run(params):
     kind = params.get("kind", "chaos")
-    if kind not in RUN_KINDS or kind == "load":
-        raise HttpError(400, "kind must be chaos or integration (load tests aren't built yet)")
-    reject = _int_param(params, "reject_percent", 50, 0, 100)
+    if kind not in RUN_KINDS:
+        raise HttpError(400, f"kind must be one of {', '.join(RUN_KINDS)}")
+    reject = _int_param(params, "reject_percent", 30 if kind == "load" else 50, 0, 100)
     kn = {"kill_percent": _int_param(params, "kill_percent", 0, 0, MAX_KILL_PERCENT),
           "slow_percent": _int_param(params, "slow_percent", 0, 0, MAX_SLOW_PERCENT),
           "dup_percent": _int_param(params, "dup_percent", 0, 0, MAX_DUP_PERCENT),
           "poison_percent": _int_param(params, "poison_percent", 0, 0, MAX_POISON_PERCENT),
           "throttle_percent": _int_param(params, "throttle_percent", 0, 0, MAX_THROTTLE_PERCENT)}
-    records = golden_count()
-    if not records:
-        raise HttpError(409, "no customer records loaded; POST /load first")
+    load_fields = {}
+    if kind == "load":
+        # A clean throughput run: generated unique records, no injected faults.
+        kn = {k: 0 for k in kn}
+        records = _int_param(params, "records", LOAD_MAX_RECORDS, 10, LOAD_MAX_RECORDS)
+        load_fields = {
+            "seed": generator.LOAD_SEED, "cursor": 0, "produced": 0, "create_skipped": 0, "handoffs": 0,
+            "backpressure_s": 0,
+            "max_backlog": 0, "producer_beat": round(now(), 3),
+            "backlog_cap": _int_param(params, "backlog_cap", LOAD_BACKLOG_CAP, LOAD_BLOCK, LOAD_BACKLOG_CAP),
+            "chunk_s": _int_param(params, "chunk_s", LOAD_CHUNK_S, 1, LOAD_CHUNK_S),
+            "rate": min(float(params.get("rate") or LOAD_RECORDS_PER_SEC), LOAD_RECORDS_PER_SEC)}
+    else:
+        records = golden_count()
+        if not records:
+            raise HttpError(409, "no customer records loaded; POST /load first")
     t = now()
     stamp = datetime.fromtimestamp(t, timezone.utc)
     run_id = f"run-{stamp:%Y%m%d-%H%M%S}-{random.randint(0, 0xffffff):06x}"
@@ -337,7 +370,7 @@ def start_run(params):
     common_fields = {"run_id": run_id, "kind": kind, "status": "starting", "started_at": round(t, 3),
                      "reject_percent": reject, **kn, "records": records, "max_workers": max_workers,
                      "ttl": ttl_for(t)}
-    meta = {**meta_key(run_id), **common_fields, "index_sk": index_sk, "closed": 0, "resolved": 0,
+    meta = {**meta_key(run_id), **common_fields, **load_fields, "index_sk": index_sk, "closed": 0, "resolved": 0,
             "human_review": 0, "passes_total": 0, "closed_by_pass": {}, "last_progress_at": round(t, 3)}
     index = {"pk": INDEX_PK, "sk": index_sk, **common_fields}
     token = params.get("client_token")
@@ -357,7 +390,7 @@ def start_run(params):
     except Exception as e:
         finish(run_id, "failed", error=f"could not start the run: {type(e).__name__}")
         raise HttpError(503, "could not start the run; it was rolled back, try again")
-    return {"run_id": run_id, "kind": kind, "status": "starting", "reject_percent": reject, **kn,
+    return {"run_id": run_id, "kind": kind, "status": "starting", "reject_percent": reject, **kn, **load_fields,
             "records": records, "workers": f"autoscaled by SQS, up to {max_workers}, shared by all runs"}
 
 
@@ -366,14 +399,22 @@ def run_async(ev):
     try:
         return _run_async(ev["run_id"])
     except Exception as e:
-        finish(ev["run_id"], "failed", error=f"run start failed: {type(e).__name__}: {e}"[:300])
-        return {"run_id": ev["run_id"], "status": "failed"}
+        # Only a run still "starting" has failed to start. A load run's producer can die after the
+        # run is under way; housekeeping restarts it from its cursor.
+        if transition(ev["run_id"], "failed", ["starting"], finished_at=round(now(), 3),
+                      error=f"run start failed: {type(e).__name__}: {e}"[:300]):
+            safe_reconcile()
+            return {"run_id": ev["run_id"], "status": "failed"}
+        print(dumps({"producer": "failed", "run_id": ev["run_id"], "error": f"{type(e).__name__}: {e}"[:300]}))
+        return {"run_id": ev["run_id"], "error": type(e).__name__}
 
 
 def _run_async(run_id):
     meta = get_meta(run_id, consistent=True)
     if meta.get("status") != "starting":
         return {"run_id": run_id, "status": meta.get("status")}
+    if meta.get("kind") == "load":
+        return produce(run_id)
     safe_reconcile()                            # workers on early: overlaps with copying records
     t = float(meta["started_at"])
     pacer = WcuPacer(pace_rate(os.environ.get("RUN_INIT_WCU_PER_SEC")))
@@ -415,6 +456,189 @@ def _run_async(run_id):
     safe_reconcile()
     print(dumps({"run_id": run_id, "records": len(cases), "messages": len(entries), **kn}))
     return {"run_id": run_id, "records": len(cases)}
+
+
+def backlog():
+    a = sqs.get_queue_attributes(QueueUrl=REBOOKING_QUEUE, AttributeNames=["ApproximateNumberOfMessages"])
+    return int(a["Attributes"]["ApproximateNumberOfMessages"])
+
+
+def produce_async(ev):
+    try:
+        return produce(ev["run_id"])
+    except Exception as e:                      # housekeeping restarts a producer that stops beating
+        print(dumps({"producer": "failed", "run_id": ev["run_id"], "error": f"{type(e).__name__}: {e}"[:300]}))
+        return {"run_id": ev["run_id"], "error": type(e).__name__}
+
+
+def produce(run_id):
+    """
+    Release a load run's generated records: create each record's run copy and enqueue its
+    first-pass message, LOAD_BLOCK at a time, at no more than `rate` records/s, and never while
+    the rebooking backlog would pass `backlog_cap` (backpressure). After `chunk_s` seconds it
+    hands off to a fresh invocation of itself.
+
+    Safe to run again from any point: records are created with a conditional put (never twice)
+    and the cursor only advances by compare-and-set after a block's messages are sent. A
+    producer that dies mid-block leaves the cursor behind, so the next one redoes that block:
+    the creates are skipped (counted in create_skipped) and its messages are sent again, which
+    the workers treat as ordinary duplicates.
+    """
+    meta = get_meta(run_id, consistent=True)
+    if meta.get("status") not in ACTIVE:
+        return {"run_id": run_id, "status": meta.get("status")}
+    if meta.get("status") == "starting":
+        safe_reconcile()                        # workers on before the first message
+    n, rate, cap = int(meta["records"]), float(meta["rate"]), int(meta["backlog_cap"])
+    seed, t_start = meta["seed"], float(meta["started_at"])
+    deadline = now() + int(meta["chunk_s"])
+    columns = [c for c in input_columns() if c != KEY]
+    kn = knobs(meta)                            # all zero for load runs: one plain message per record
+    cursor = int(meta["cursor"])
+    t0, released, max_seen, last_beat, waited = now(), 0, int(meta.get("max_backlog", 0)), 0.0, 0
+    while cursor < n and now() < deadline:
+        depth = backlog()
+        max_seen = max(max_seen, depth)
+        if depth + LOAD_BLOCK > cap:            # backpressure: let the workers catch up
+            time.sleep(1)
+            waited += 1
+            if now() - last_beat > 10:
+                ddb.update_item(TableName=RUNS_TABLE, Key=to_ddb(meta_key(run_id)),
+                                UpdateExpression="SET producer_beat = :t, max_backlog = :m ADD backpressure_s :w",
+                                ExpressionAttributeValues=to_ddb({":t": round(now(), 3), ":m": max_seen, ":w": waited}))
+                last_beat, waited = now(), 0
+            t0 += 1                             # time spent held back doesn't count toward the pace
+            continue
+        block = range(cursor + 1, min(cursor + LOAD_BLOCK, n) + 1)
+        skipped = 0
+        for i in block:
+            case_id = f"LOAD-{i:05d}"
+            item = {**generator.make_inputs(i, seed, columns), **case_key(run_id, case_id), KEY: case_id,
+                    "run_id": run_id, "status": "queued", "pass_no": 1, "queued_at": round(now(), 3),
+                    "history": [], "claims": 0, "fencing_token": 0, "ttl": ttl_for(t_start)}
+            try:
+                ddb.put_item(TableName=RUNS_TABLE, Item=to_ddb(item), ConditionExpression="attribute_not_exists(pk)")
+            except ddb.exceptions.ConditionalCheckFailedException:
+                skipped += 1                    # created by a producer that died before advancing
+        bodies = [b for i in block for b in outgoing(run_id, f"LOAD-{i:05d}", 1, kn)]
+        sqs.send_message_batch(QueueUrl=REBOOKING_QUEUE, Entries=[
+            {"Id": str(j), "MessageBody": b, "MessageGroupId": run_id} for j, b in enumerate(bodies)])
+        new = block[-1]
+        try:
+            ddb.update_item(TableName=RUNS_TABLE, Key=to_ddb(meta_key(run_id)),
+                            UpdateExpression=("SET #c = :new, producer_beat = :t, max_backlog = :m "
+                                              "ADD produced :n, create_skipped :s, backpressure_s :w"),
+                            ConditionExpression="#c = :old",
+                            ExpressionAttributeNames={"#c": "cursor"},
+                            ExpressionAttributeValues=to_ddb({":new": new, ":old": cursor, ":t": round(now(), 3),
+                                                              ":m": max_seen, ":n": len(block), ":s": skipped,
+                                                              ":w": waited}))
+        except ddb.exceptions.ConditionalCheckFailedException:
+            # Another producer moved the cursor (a restart raced a slow one): continue from there.
+            cursor = int(get_meta(run_id, consistent=True)["cursor"])
+            continue
+        cursor, waited = new, 0
+        released += len(block)
+        if released == len(block) and meta.get("status") == "starting":
+            transition(run_id, "running", ["starting"], queued_at=round(now(), 3))
+        ahead = released / rate - (now() - t0)  # pacing: never faster than `rate` records/s
+        if ahead > 0:
+            time.sleep(ahead)
+    if cursor < n:
+        if get_meta(run_id).get("status") in ACTIVE:
+            ddb.update_item(TableName=RUNS_TABLE, Key=to_ddb(meta_key(run_id)), UpdateExpression="ADD handoffs :one",
+                            ExpressionAttributeValues=to_ddb({":one": 1}))
+            invoke_self({"internal": "produce", "run_id": run_id})
+        return {"run_id": run_id, "cursor": cursor, "handed_off": True}
+    return {"run_id": run_id, "cursor": cursor, "done": True}
+
+
+def finalize_load(run_id):
+    """
+    Score a finished load run once, reading its records a single time at a paced rate: lost
+    records, records with two results for one pass, outcomes outside each record's acceptable
+    list (regenerated from its seed), and the worker concurrency it reached.
+    """
+    meta = get_meta(run_id, consistent=True)
+    rows, start, t0, used = [], None, time.monotonic(), 0.0
+    while True:
+        kw = {"TableName": RUNS_TABLE, "KeyConditionExpression": "pk = :p AND begins_with(sk, :c)",
+              "ExpressionAttributeValues": to_ddb({":p": run_pk(run_id), ":c": "CASE#"}),
+              "ReturnConsumedCapacity": "TOTAL", "Limit": 100}
+        if start:
+            kw["ExclusiveStartKey"] = start
+        resp = ddb.query(**kw)
+        rows += [from_ddb(i) for i in resp.get("Items", [])]
+        used += consumed(resp)
+        ahead = used / FINALIZE_READ_PER_SEC - (time.monotonic() - t0)
+        if ahead > 0:
+            time.sleep(ahead)
+        start = resp.get("LastEvaluatedKey")
+        if not start:
+            break
+    seed = meta.get("seed", generator.LOAD_SEED)
+    double = outside = 0
+    for r in rows:
+        hist = r.get("history", [])
+        if len({int(h["p"]) for h in hist}) != len(hist):
+            double += 1
+        rec = generator.make_record(int(r[KEY].split("-")[1]), seed)
+        acceptable = rec["acceptable_resolutions"].split("|")
+        unacceptable = set(rec["unacceptable_resolutions"].split("|")) - {"none"}
+        if (r.get("status") == "resolved" and r.get("resolution") not in acceptable) or \
+                any(h["o"] in unacceptable for h in hist):
+            outside += 1
+    end = float(meta.get("finished_at") or now())
+    activity = worker_activity(rows, [], float(meta["started_at"]), end, now())
+    closed = int(meta.get("closed", 0))
+    summary = {"records": int(meta["records"]), "created": len(rows), "closed": closed,
+               "lost": int(meta["records"]) - closed, "double_results": double, "outside_rules": outside,
+               "resolved": int(meta.get("resolved", 0)), "human_review": int(meta.get("human_review", 0)),
+               "avg_passes": round(int(meta.get("passes_total", 0)) / max(1, closed), 2),
+               "duration_s": round(end - float(meta["started_at"]), 1), "peak_workers": activity["peak"],
+               "max_backlog": int(meta.get("max_backlog", 0)), "backlog_cap": int(meta.get("backlog_cap", 0)),
+               "handoffs": int(meta.get("handoffs", 0)), "create_skipped": int(meta.get("create_skipped", 0)),
+               "backpressure_s": int(meta.get("backpressure_s", 0)), "read_units_spent": round(used, 1)}
+    summary["passed"] = (summary["lost"] == 0 and double == 0 and outside == 0 and len(rows) == summary["records"]
+                         and summary["max_backlog"] <= summary["backlog_cap"])
+    for key in (meta_key(run_id), {"pk": INDEX_PK, "sk": meta["index_sk"]}):
+        ddb.update_item(TableName=RUNS_TABLE, Key=to_ddb(key), UpdateExpression="SET #f = :f",
+                        ExpressionAttributeNames={"#f": "final"}, ExpressionAttributeValues=to_ddb({":f": summary}))
+    _cache.clear()
+    print(dumps({"load_summary": run_id, **summary}))
+    return summary
+
+
+def load_detail(meta, queues, t):
+    """A load run's view: counters and the final summary only, never its 1,000 records."""
+    run_id = meta["run_id"]
+    status = meta["status"]
+    records, closed = int(meta.get("records", 0)), int(meta.get("closed", 0))
+    if status == "running" and records and closed >= records:
+        finish(run_id, "complete")
+        meta = get_meta(run_id, consistent=True)
+        status = meta["status"]
+    started = float(meta["started_at"])
+    end = float(meta["finished_at"]) if meta.get("finished_at") else t
+    final = meta.get("final") if isinstance(meta.get("final"), dict) else None
+    if status in FINISHED and not final and t - end > FINALIZE_RETRY_S:
+        # The finalizer is an async invoke with no retries: if it died, the next viewer restarts it
+        # (at most once per FINALIZE_RETRY_S, claimed with a conditional write).
+        try:
+            ddb.update_item(TableName=RUNS_TABLE, Key=to_ddb(meta_key(run_id)), UpdateExpression="SET finalize_at = :t",
+                            ConditionExpression="attribute_not_exists(finalize_at) OR finalize_at < :old",
+                            ExpressionAttributeValues=to_ddb({":t": round(t, 3), ":old": round(t - FINALIZE_RETRY_S, 3)}))
+            invoke_self({"internal": "finalize", "run_id": run_id})
+        except ddb.exceptions.ConditionalCheckFailedException:
+            pass
+    stats = {"records": records, "closed": closed, "open": records - closed, "released": int(meta.get("cursor", 0)),
+             "resolved": int(meta.get("resolved", 0)), "human_review": int(meta.get("human_review", 0)),
+             "backlog_now": queues["rebooking"]["visible"], "max_backlog": int(meta.get("max_backlog", 0)),
+             "backlog_cap": int(meta.get("backlog_cap", 0)), "handoffs": int(meta.get("handoffs", 0)),
+             "backpressure_s": int(meta.get("backpressure_s", 0)), "duration_s": round(end - started, 1)}
+    keep = {k: v for k, v in meta.items() if k not in ("pk", "sk", "closed_by_pass", "final")}
+    return {**keep, "status": status, "stats": stats, "summary": final, "records": [], "kills": [],
+            "workers": [], "incidents": [], "sweeps": [], "timeline": None}
 
 
 def cancel(params):
@@ -525,6 +749,9 @@ def results(run_id=None, force=False):
 
 
 def run_detail(run_id, queues, t):
+    head = get_meta(run_id)
+    if head.get("kind") == "load":
+        return load_detail(head, queues, t)
     items = query_all(KeyConditionExpression="pk = :p", ExpressionAttributeValues=to_ddb({":p": run_pk(run_id)}))
     meta = next((i for i in items if i["sk"] == "META"), None)
     if not meta:
@@ -705,6 +932,10 @@ def _housekeeping():
         elif int(meta.get("closed", 0)) >= int(meta.get("records", 0)) > 0 and meta["status"] == "running":
             finish(run_id, "complete")
             actions[run_id] = "complete"
+        elif (meta.get("kind") == "load" and int(meta.get("cursor", 0)) < int(meta.get("records", 0))
+              and t - float(meta.get("producer_beat", started)) > PRODUCER_STALE_S):
+            invoke_self({"internal": "produce", "run_id": run_id})     # cursor CAS makes this safe
+            actions[run_id] = "restarted producer"
         else:
             oldest_progress = max(oldest_progress, t - float(meta.get("last_progress_at", started)))
             if meta["status"] == "running" and t - float(meta.get("last_progress_at", started)) > ORPHAN_S:
@@ -795,6 +1026,10 @@ def handler(event, context):
         return run_async(event)
     if event.get("internal") == "housekeeping":
         return housekeeping()
+    if event.get("internal") == "produce":
+        return produce_async(event)
+    if event.get("internal") == "finalize":
+        return finalize_load(event["run_id"])
     if "requestContext" in event:
         try:
             return route(event)

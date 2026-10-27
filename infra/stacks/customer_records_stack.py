@@ -23,7 +23,7 @@ ROOT = Path(__file__).resolve().parents[2]
 CSV = ROOT / "golden_set" / "golden_set_irops_msp.csv"
 SRC = ROOT / "infra" / "experiment_control"
 BUILD = ROOT / "infra" / ".build" / "experiment_control"
-RUNTIME_FILES = ["common.py", "handler.py", "analysis.py", "worker.py", "sweeper.py", "throttle.py", "ui.html"]
+RUNTIME_FILES = ["common.py", "handler.py", "analysis.py", "worker.py", "sweeper.py", "throttle.py", "generator.py", "ui.html"]
 
 # Free tier: 25 provisioned RCU + 25 provisioned WCU per account, across ALL tables.
 # Provisioned capacity is what's billed, so these numbers ARE the cost ceiling: no
@@ -39,6 +39,17 @@ RUN_INIT_WCU_PER_SEC = 12      # copying records into a run (experiment-runs, 20
 MAX_ACTIVE_RUNS = 6
 RECORD_BUDGET = 1300           # records in flight: one 1,000-record load test + three 100-record runs
 RUN_TTL_S = 24 * 3600          # DynamoDB deletes run data (free) a day after the run started
+
+# Load tests: generated, unique records. The producer releases them at a rate that keeps the
+# experiment-runs table under the capacity alarm: ~7 write units per record (create 1, claim and
+# commit per pass, and a transactional close that writes 2 items at 2x), so 2 records/s ~ 14-15
+# of the 20 provisioned, under the 80% (16) alarm line. It also never lets the rebooking backlog
+# grow past LOAD_BACKLOG_CAP, well under the backlog alarm.
+LOAD_MAX_RECORDS = 1000
+LOAD_RECORDS_PER_SEC = 2.0
+LOAD_BACKLOG_CAP = 500
+LOAD_CHUNK_S = 540             # a producer invocation hands off to a fresh one before its 10-min timeout
+QUEUE_RETENTION_DAYS = 1       # was 1 hour: a backlog drained at ~2 records/s must never expire
 
 ALARM_EMAIL = "verma.esha@gmail.com"
 # Alarm thresholds derive from the limits above, so changing a limit moves its alarm.
@@ -59,6 +70,7 @@ VISIBILITY_SECONDS = 20
 # Autoscaling ceiling, per queue. The account's Lambda concurrency limit is 10 (new-account
 # default) and is shared by every function, so workers get 8 and the UI/API keeps 2.
 # After a quota increase, raise these: e.g. 20 and 10.
+LAMBDA_ACCOUNT_CONCURRENCY = 10   # this account's quota (see the AWS limits workflow)
 REBOOKING_MAX_WORKERS = 5
 REROUTING_MAX_WORKERS = 3
 CONTROL_FN = "effect-demo-experiment-control"
@@ -111,7 +123,7 @@ class CustomerRecordsStack(Stack):
                         retention_period=Duration.days(1), encryption=sqs.QueueEncryption.SQS_MANAGED)
         redrive = sqs.DeadLetterQueue(queue=dlq, max_receive_count=MAX_RECEIVES)
         queue_props = dict(visibility_timeout=Duration.seconds(VISIBILITY_SECONDS),
-                           retention_period=Duration.hours(1), dead_letter_queue=redrive,
+                           retention_period=Duration.days(QUEUE_RETENTION_DAYS), dead_letter_queue=redrive,
                            encryption=sqs.QueueEncryption.SQS_MANAGED)
         rebooking = sqs.Queue(self, "Rebooking", queue_name="effect-demo-rebooking", **queue_props)
         rerouting = sqs.Queue(self, "Rerouting", queue_name="effect-demo-rerouting", **queue_props)
@@ -124,6 +136,8 @@ class CustomerRecordsStack(Stack):
             "RUN_INIT_WCU_PER_SEC": str(RUN_INIT_WCU_PER_SEC), "LEASE_SECONDS": str(LEASE_SECONDS),
             "MAX_ACTIVE_RUNS": str(MAX_ACTIVE_RUNS), "RECORD_BUDGET": str(RECORD_BUDGET),
             "RUN_TTL_S": str(RUN_TTL_S),
+            "LOAD_MAX_RECORDS": str(LOAD_MAX_RECORDS), "LOAD_RECORDS_PER_SEC": str(LOAD_RECORDS_PER_SEC),
+            "LOAD_BACKLOG_CAP": str(LOAD_BACKLOG_CAP), "LOAD_CHUNK_S": str(LOAD_CHUNK_S),
             "VISIBILITY_SECONDS": str(VISIBILITY_SECONDS),
             "REBOOKING_QUEUE_URL": rebooking.queue_url, "REROUTING_QUEUE_URL": rerouting.queue_url,
             "DLQ_URL": dlq.queue_url,
@@ -245,7 +259,8 @@ class CustomerRecordsStack(Stack):
                           display_name="IROPS demo alarms")
         topic.add_subscription(subs.EmailSubscription(ALARM_EMAIL))
         minute, five = Duration.minutes(1), Duration.minutes(5)
-        per_min_capacity = RUNS_WCU * 60 * ALARM_CAPACITY_SHARE
+        per_min_writes = RUNS_WCU * 60 * ALARM_CAPACITY_SHARE
+        per_min_reads = RUNS_RCU * 60 * ALARM_CAPACITY_SHARE
 
         def alarm(cid, metric, threshold, periods, what, op=cw.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD):
             a = cw.Alarm(self, cid, alarm_name=f"effect-demo-{cid}", metric=metric, threshold=threshold,
@@ -268,10 +283,10 @@ class CustomerRecordsStack(Stack):
               rebooking.metric_approximate_number_of_messages_visible(period=minute, statistic="Maximum"),
               ALARM_BACKLOG, 3, "Backlog above the producer's cap: backpressure isn't holding")
         alarm("runs-table-write-capacity",
-              runs.metric_consumed_write_capacity_units(period=minute, statistic="Sum"), per_min_capacity, 5,
+              runs.metric_consumed_write_capacity_units(period=minute, statistic="Sum"), per_min_writes, 5,
               f"experiment-runs writes above {int(ALARM_CAPACITY_SHARE * 100)}% of {RUNS_WCU} WCU for 5 minutes")
         alarm("runs-table-read-capacity",
-              runs.metric_consumed_read_capacity_units(period=minute, statistic="Sum"), per_min_capacity, 5,
+              runs.metric_consumed_read_capacity_units(period=minute, statistic="Sum"), per_min_reads, 5,
               f"experiment-runs reads above {int(ALARM_CAPACITY_SHARE * 100)}% of {RUNS_RCU} RCU for 5 minutes")
         alarm("runs-table-throttled",
               cw.Metric(namespace="AWS/DynamoDB", metric_name="WriteThrottleEvents",

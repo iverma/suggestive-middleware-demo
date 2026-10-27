@@ -1,0 +1,56 @@
+name: Load check
+
+# Live 1,000-record load test against the deployed demo: generated unique records released
+# under a low backlog cap (so backpressure engages) with short producer chunks (so the producer
+# hands off several times). Fails if any record is lost, doubled or scored outside the rules,
+# if the backlog passes its cap, or if any demo alarm fired / DynamoDB passed 80% of capacity
+# or throttled while it ran (CloudWatch read through the read-only CDK lookup role).
+# Shares the live-check concurrency group, so it never overlaps the other live checks.
+on:
+  workflow_dispatch:
+    inputs:
+      records: { description: "Records", default: "1000" }
+      backlog_cap: { description: "Backlog cap", default: "10" }
+      chunk_s: { description: "Producer chunk seconds", default: "60" }
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/load-check.yml"
+      - "scripts/load_check.py"
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: live-check
+  cancel-in-progress: false
+
+env:
+  DEMO_URL: https://htd5qtuasvlslvzldh3bsragui0jdkwr.lambda-url.us-west-2.on.aws/
+
+jobs:
+  load:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - name: Read-only credentials for CloudWatch (CDK lookup role)
+        run: |
+          ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+          CREDS=$(aws sts assume-role --role-arn "arn:aws:iam::${ACCOUNT}:role/cdk-hnb659fds-lookup-role-${ACCOUNT}-${AWS_REGION}" \
+                  --role-session-name load-check --duration-seconds 3600 --query Credentials --output json)
+          echo "::add-mask::$(echo "$CREDS" | jq -r .SecretAccessKey)"
+          echo "::add-mask::$(echo "$CREDS" | jq -r .SessionToken)"
+          echo "AWS_ACCESS_KEY_ID=$(echo "$CREDS" | jq -r .AccessKeyId)" >> "$GITHUB_ENV"
+          echo "AWS_SECRET_ACCESS_KEY=$(echo "$CREDS" | jq -r .SecretAccessKey)" >> "$GITHUB_ENV"
+          echo "AWS_SESSION_TOKEN=$(echo "$CREDS" | jq -r .SessionToken)" >> "$GITHUB_ENV"
+      - name: 1,000 records under backpressure, no alarm fired
+        run: |
+          pip install -q boto3
+          python3 scripts/load_check.py "$DEMO_URL" "${{ inputs.records || '1000' }}" \
+            "${{ inputs.backlog_cap || '10' }}" "${{ inputs.chunk_s || '60' }}"

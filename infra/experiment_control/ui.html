@@ -161,6 +161,7 @@
       <label>Throttle % <input type="number" id="throttle" min="0" max="30" value="0"></label>
       <button type="submit" class="primary" id="btn-run">Start run</button>
       <button type="button" id="btn-cancel" hidden>Cancel this run</button>
+      <button type="button" id="btn-loadtest" title="1,000 generated unique records, no injected faults, released at a paced rate under a backlog cap">Load test (1,000)</button>
       <button type="button" id="btn-load">Load records</button>
       <button type="button" id="btn-reset">Reset everything</button>
     </form>
@@ -252,6 +253,7 @@
 const $ = (id) => document.getElementById(id);
 let data = null, busy = false, timer = null, selected = null, clockOffset = 0;
 const ACTIVE = ["starting", "running", "stalled", "recovering"];
+const FINISHED_STATES = ["complete", "failed", "cancelled"];
 const POOLS = [["rebooking", "First-pass workers", "--pool-1"], ["rerouting", "Re-route workers", "--pool-2"]];
 
 function esc(s) { return String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
@@ -304,6 +306,7 @@ $("controls").addEventListener("submit", (e) => {
   call(`/run?${q}`, "Starting run");
 });
 $("btn-load").onclick = () => call("/load", "Loading records");
+$("btn-loadtest").onclick = () => call(`/run?${new URLSearchParams({ kind: "load", records: 1000, client_token: crypto.randomUUID() })}`, "Starting load test");
 $("btn-cancel").onclick = () => { if (viewing && confirm(`Cancel ${viewing}? Other runs are not affected.`)) call(`/cancel?run=${encodeURIComponent(viewing)}`, "Cancelling"); };
 $("btn-reset").onclick = () => { if (confirm("Cancel EVERY run for everyone, empty the queues and delete all run data? Customer records are kept.")) call("/reset?confirm=everything", "Resetting everything"); };
 
@@ -569,6 +572,28 @@ function renderWorkers(run) {
     : `<tr><td class="empty-note">Workers appear when the queue scales them up.</td></tr>`;
 }
 
+function loadLine(f) {
+  return `${f.passed ? "PASSED" : "FAILED"}: ${f.closed} of ${f.records} closed, ${f.lost} lost, ${f.double_results} double results, ` +
+    `${f.outside_rules} outside the rules; ${f.peak_workers} peak workers; backlog peaked at ${f.max_backlog} (cap ${f.backlog_cap}); ` +
+    `${f.handoffs} producer handoffs; took ${clock(f.duration_s)}.`;
+}
+function renderLoadbox(run) {
+  const s = run.stats, f = run.summary;
+  const pct = s.records ? Math.round(100 * s.closed / s.records) : 0;
+  $("runbox").innerHTML = `
+    <h2>${mine.has(run.run_id) ? "Your load test" : "Load test"} <span class="runstate ${esc(run.status)}">${esc(run.status)}</span></h2>
+    <div class="clock" id="run-clock" aria-label="Processing time">${clock(elapsed(run))}</div>
+    <p class="clock-note">${pct}% closed. Records are released at up to ${run.rate}/s and never while the backlog would pass ${s.backlog_cap}.</p>
+    <dl>
+      <dt>Released</dt><dd>${s.released} of ${s.records}</dd>
+      <dt>Closed</dt><dd>${s.closed} (${s.resolved} accepted, ${s.human_review} to a person)</dd>
+      <dt>Backlog now</dt><dd>${s.backlog_now}</dd>
+      <dt>Backlog peak</dt><dd>${s.max_backlog} of cap ${s.backlog_cap}</dd>
+      <dt>Producer handoffs</dt><dd>${s.handoffs}</dd>
+    </dl>
+    <p class="empty-note" style="margin-top:10px">${f ? esc(loadLine(f)) : FINISHED_STATES.includes(run.status) ? "Scoring the run…" : `load run ${esc(run.run_id)}: generated unique records, no injected faults.`}${run.error ? ` (${esc(run.error)})` : ""}</p>`;
+}
+
 function renderRuns(runs) {
   const cur = data && data.latest_run && data.latest_run.run_id;
   $("runs-t").innerHTML = runs.length ? `<tr><th>Run</th><th>Kind</th><th>Started</th><th>State</th><th class="n">Reject %</th><th class="n">Crash %</th><th class="n">Slow %</th><th class="n">Dup %</th><th class="n">Crashes</th><th class="n">Fenced</th><th class="n">Double results</th>
@@ -578,7 +603,7 @@ function renderRuns(runs) {
       <td class="n">${r.slow_percent ?? "–"}</td><td class="n">${r.dup_percent ?? "–"}</td>
       <td class="n">${f.kills_fired != null ? `${f.kills_recovered ?? f.kills_fired}/${f.kills_fired}` : "–"}</td>
       <td class="n">${f.races ? `${f.races.zombies_fenced}/${f.races.zombies}` : "–"}</td>
-      <td class="n">${f.races ? f.races.double_commits : "–"}</td><td class="n">${f.workers_peak ?? "–"}</td>
+      <td class="n">${f.races ? f.races.double_commits : "–"}</td><td class="n">${f.workers_peak ?? f.peak_workers ?? "–"}</td>
       <td class="n">${f.resolved ?? "–"}</td><td class="n">${f.satisfactory ?? "–"}</td><td class="n">${f.human_review ?? "–"}</td>
       <td class="n">${f.avg_passes ?? "–"}</td><td class="n">${f.duration_s != null ? clock(f.duration_s) : "–"}</td></tr>`; }).join("")
     : `<tr><td class="empty-note">No runs yet.</td></tr>`;
@@ -606,9 +631,16 @@ async function refresh() {
     const run = data.latest_run;
     renderActive(data);
     $("btn-cancel").hidden = !(run && ACTIVE.includes(run.status));
-    renderBoard(run, data.records_in_table); renderRunbox(run, data.worker_mappings);
-    renderChart(run, data.worker_mappings); renderPasses(run); renderQueues(data.queues, data.worker_mappings);
-    renderWorkers(run); renderFeed(run); renderDegradation(run); renderCrashes(run); renderRaces(run); renderRuns(data.recent_runs || []); renderRecords(run); renderDetail(); tick();
+    if (run && run.kind === "load") {
+      // A load run never ships its records: show its counters and, once scored, its one-line result.
+      renderBoard(null, 0); renderLoadbox(run); renderChart(null, data.worker_mappings); renderPasses(null);
+      renderQueues(data.queues, data.worker_mappings); renderWorkers(null); renderFeed(null); renderDegradation(null);
+      renderCrashes(null); renderRaces(null); renderRuns(data.recent_runs || []); renderRecords(null); $("detail").hidden = true; tick();
+    } else {
+      renderBoard(run, data.records_in_table); renderRunbox(run, data.worker_mappings);
+      renderChart(run, data.worker_mappings); renderPasses(run); renderQueues(data.queues, data.worker_mappings);
+      renderWorkers(run); renderFeed(run); renderDegradation(run); renderCrashes(run); renderRaces(run); renderRuns(data.recent_runs || []); renderRecords(run); renderDetail(); tick();
+    }
     if (!run && !busy) say(data.records_in_table ? `${data.records_in_table} records loaded. Start a run.` : "No records loaded. Load records to begin.");
   } catch (e) { say(`Couldn't read results: ${e.message}`, true); }
   const live = data && ((data.latest_run && ACTIVE.includes(data.latest_run.status)) || (data.active_runs || []).length);

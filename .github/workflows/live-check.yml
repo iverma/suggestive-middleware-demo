@@ -43,11 +43,12 @@ jobs:
           "${{ inputs.poison_percent || '2' }}" "${{ inputs.throttle_percent || '10' }}"
 
   split-brain:
-    # Two clients racing each other on the same deployment, alongside the run above.
+    # Five clients racing each other on the same deployment, after the run above.
+    needs: live
+    if: always()
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
-      - name: Concurrent runs from two clients, double submit, stale cancel
+      - name: Five concurrent clients, mid-flight cancel, poison swept per partition, double submit, stale cancel
         run: python3 scripts/split_brain_check.py "$DEMO_URL"
-# re-run after the orphan fix

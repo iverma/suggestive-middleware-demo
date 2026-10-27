@@ -242,7 +242,7 @@ def test_ui_and_routes(env):
     assert http(handler, "GET", "/nope")[0] == 404
     assert http(handler, "POST", "/run", reject_percent=101)[0] == 400
     assert http(handler, "POST", "/run", kill_percent=51)[0] == 400
-    assert http(handler, "POST", "/run", kind="load")[0] == 400
+    assert http(handler, "POST", "/run", kind="nope")[0] == 400
     assert http(handler, "POST", "/reset")[0] == 400          # needs ?confirm=everything
     assert http(handler, "POST", "/cancel")[0] == 400
 
@@ -736,3 +736,70 @@ def test_transaction_conflicts_are_retried_in_place(env, monkeypatch):
     monkeypatch.setattr(common.ddb, "transact_write_items", flaky)
     common.transact([{"Put": {"TableName": "experiment-runs", "Item": {"pk": {"S": "x"}, "sk": {"S": "y"}}}}])
     assert calls["n"] == 3
+
+
+# --- load runs ------------------------------------------------------------------------------
+def wait_summary(handler, run_id, timeout=120):
+    end = time.time() + timeout
+    while time.time() < end:
+        status, res = http(handler, "GET", "/results", run=run_id)
+        assert status == 200, res
+        run = res["latest_run"]
+        if run.get("summary"):
+            return run
+        assert run["status"] not in ("failed", "cancelled"), run
+        time.sleep(0.5)
+    raise AssertionError(f"load run never scored: {json.dumps(run.get('stats'), indent=1)}")
+
+
+def test_load_run_backpressure_and_handoff(env, monkeypatch):
+    """Generated unique records, released under a backlog cap, across several producer handoffs."""
+    handler, common, *_ = env
+    monkeypatch.setattr(handler, "LOAD_RECORDS_PER_SEC", 400.0)     # far faster than the workers drain
+    run_id = start(handler, kind="load", records=80, backlog_cap=10, chunk_s=2, rate=400)
+    run = wait_summary(handler, run_id)
+    s = run["summary"]
+    assert s["passed"], s
+    assert s["records"] == s["created"] == s["closed"] == 80 and s["lost"] == 0
+    assert s["double_results"] == 0 and s["outside_rules"] == 0
+    assert s["max_backlog"] <= 10 and s["create_skipped"] == 0
+    assert s["backpressure_s"] > 0                              # the producer was held back
+    assert s["handoffs"] >= 1                                    # the release outlived one chunk
+    ids = {r["case_id"] for r in case_items(common, run_id)}
+    assert len(ids) == 80 and all(i.startswith("LOAD-") for i in ids)
+    assert run["records"] == [] and run["stats"]["released"] == 80    # the view never reads records
+
+
+def test_load_producer_dies_and_is_restarted(env, monkeypatch):
+    """A producer that dies between creating a block and advancing the cursor: the restart redoes it."""
+    handler, common, *_ = env
+    monkeypatch.setattr(handler, "LOAD_RECORDS_PER_SEC", 40.0)
+    monkeypatch.setattr(handler, "PRODUCER_STALE_S", 1)
+    real = handler.sqs.send_message_batch
+    calls = {"n": 0}
+
+    def dies_on_third(**kw):
+        calls["n"] += 1
+        if calls["n"] == 3:
+            raise RuntimeError("producer killed after creating block 3")
+        return real(**kw)
+    monkeypatch.setattr(handler.sqs, "send_message_batch", dies_on_third)
+    run_id = start(handler, kind="load", records=50, backlog_cap=50, chunk_s=60, rate=40)
+    end = time.time() + 30
+    while time.time() < end and handler.get_meta(run_id, consistent=True).get("cursor", 0) < 20:
+        time.sleep(0.2)
+    time.sleep(1.5)
+    meta = handler.get_meta(run_id, consistent=True)
+    assert meta["status"] == "running" and int(meta["cursor"]) == 20     # stuck after block 2
+    out = handler.housekeeping()
+    assert out["actions"][run_id] == "restarted producer"
+    s = wait_summary(handler, run_id)["summary"]
+    assert s["passed"], s
+    assert s["create_skipped"] == 10                     # block 3 was created once, then skipped
+    assert s["double_results"] == 0 and s["lost"] == 0
+
+
+def test_load_run_counts_against_budget(env):
+    handler, *_ = env
+    status, body = http(handler, "POST", "/run", kind="load", records=handler.RECORD_BUDGET + 1)
+    assert status == 400 or status == 409, body
