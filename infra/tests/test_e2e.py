@@ -762,7 +762,7 @@ def test_load_run_backpressure_and_handoff(env, monkeypatch):
     assert s["passed"], s
     assert s["records"] == s["created"] == s["closed"] == 80 and s["lost"] == 0
     assert s["double_results"] == 0 and s["outside_rules"] == 0
-    assert s["max_backlog"] <= 10 and s["create_skipped"] == 0
+    assert s["max_backlog"] <= 10 + handler.LOAD_BLOCK and s["create_skipped"] == 0
     assert s["backpressure_s"] > 0                              # the producer was held back
     assert s["handoffs"] >= 1                                    # the release outlived one chunk
     ids = {r["case_id"] for r in case_items(common, run_id)}

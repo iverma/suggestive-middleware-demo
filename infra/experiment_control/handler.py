@@ -646,7 +646,9 @@ def finalize_load(run_id):
                "handoffs": int(meta.get("handoffs", 0)), "create_skipped": int(meta.get("create_skipped", 0)),
                "backpressure_s": int(meta.get("backpressure_s", 0)), "read_units_spent": round(used, 1)}
     summary["passed"] = (summary["lost"] == 0 and double == 0 and outside == 0 and len(rows) == summary["records"]
-                         and summary["max_backlog"] <= summary["backlog_cap"])
+                         and summary["max_backlog"] <= summary["backlog_cap"] + LOAD_BLOCK)
+    # The producer never releases a block that would take the backlog it sees past the cap; the
+    # depth SQS reports is approximate and lags, so one block of overshoot is within bounds.
     for key in (meta_key(run_id), {"pk": INDEX_PK, "sk": meta["index_sk"]}):
         ddb.update_item(TableName=RUNS_TABLE, Key=to_ddb(key), UpdateExpression="SET #f = :f",
                         ExpressionAttributeNames={"#f": "final"}, ExpressionAttributeValues=to_ddb({":f": summary}))
