@@ -62,7 +62,7 @@ import uuid
 
 import throttle
 from common import (
-    ACTIVE, RUN_TTL_S, cancellation, case_key, close_counters, is_throttle, meta_key, run_pk,
+    ACTIVE, RUN_TTL_S, cancellation, case_key, close_counters, is_throttle, meta_key, run_pk, transact,
     LEASE_SECONDS, REBOOKING_QUEUE, REROUTING_QUEUE, RUNS_TABLE, TERMINAL,
     VISIBILITY_SECONDS, customer_rejects, ddb, from_ddb, knobs, now, offer_sequence, outgoing, sqs, to_ddb,
 )
@@ -373,9 +373,7 @@ def process(record, reject_percent=None, context=None):
             ddb.update_item(**record_update)
         else:
             # Closing the record and counting it toward the run's progress happen together.
-            ddb.transact_write_items(TransactItems=[
-                {"Update": record_update},
-                close_counters(run_id, pass_no, values[":final"], now())])
+            transact([{"Update": record_update}, close_counters(run_id, pass_no, values[":final"], now())])
     except ddb.exceptions.ConditionalCheckFailedException as e:
         current = from_ddb(e.response.get("Item"))
     except ddb.exceptions.TransactionCanceledException as e:
@@ -457,8 +455,9 @@ def backoff_seconds(n):
 
 def on_error(record, exc):
     """Log, count, and decide when the failed message should be retried."""
+    conflict = "TransactionConflict" in str(exc)
     kind = ("throttled" if is_throttle(exc) else "poison" if isinstance(exc, PoisonMessage)
-            else "injected" if isinstance(exc, InjectedFault) else "error")
+            else "injected" if isinstance(exc, InjectedFault) else "conflict" if conflict else "error")
     try:
         body = json.loads(record.get("body") or "{}")
     except ValueError:

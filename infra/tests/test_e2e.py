@@ -675,3 +675,64 @@ def test_results_tolerate_kill_items_from_older_versions(env):
     status, res = http(handler, "GET", "/results", run="run-old")
     assert status == 200, res
     assert res["latest_run"]["kills"][0]["point"] == "before_commit"
+
+
+# --- orphans and conflicts (found on AWS: a record left queued with no message anywhere) ---------
+def test_orphaned_record_is_requeued_and_the_run_completes(env, monkeypatch):
+    """A handoff lost with its message already acknowledged: the queues drain, one record stays
+    open with nothing left to deliver it. The orphan re-queue must notice and finish the run."""
+    handler, common, worker, esm, threads = env
+    monkeypatch.setattr(handler, "ORPHAN_S", 3)
+    monkeypatch.setattr(handler, "STALL_S", 3)
+    real_send = worker.send_handoff
+    lost = {"n": 0}
+
+    def lossy(run_id, case_id, pass_no, kn, repair=False):
+        if case_id == "IROPS-MSP-0005" and pass_no == 2 and not repair and not lost["n"]:
+            lost["n"] += 1                            # the message vanishes, the incoming one is acked
+            return
+        return real_send(run_id, case_id, pass_no, kn, repair)
+    monkeypatch.setattr(worker, "send_handoff", lossy)
+    monkeypatch.setattr(worker, "customer_rejects", lambda run_id, case_id, pass_no, pct: case_id == "IROPS-MSP-0005" and pass_no == 1)
+    http(handler, "POST", "/load")
+    run_id = start(handler, reject_percent=0)
+    res = wait_complete(handler, run_id, timeout=120)
+    s = res["latest_run"]["stats"]
+    assert lost["n"] == 1 and s["closed"] == 100 and s["open"] == 0
+    assert s["degradation"]["orphans_requeued"] >= 1
+    assert any(i["kind"] == "requeued" and i["case_id"] == "IROPS-MSP-0005" for i in res["latest_run"]["incidents"])
+
+
+def test_sweeper_requeues_a_later_pass_instead_of_dropping_its_dead_letter(env):
+    handler, common, worker, esm, threads = env
+    import sweeper
+    run_id, t = "run-dlq", time.time()
+    common.ddb.put_item(TableName="experiment-runs", Item=common.to_ddb(
+        {**common.case_key(run_id, "IROPS-MSP-0009"), "case_id": "IROPS-MSP-0009", "run_id": run_id,
+         "status": "queued", "pass_no": 2, "queued_at": t - LEASE - 5, "history": [], "fencing_token": 1}))
+    common.sqs.send_message(QueueUrl=common.DLQ, MessageBody=json.dumps(
+        {"run_id": run_id, "case_id": "IROPS-MSP-0009", "pass": 1}))
+    out = sweeper.handler({}, Ctx(60))
+    assert out["requeued_later_pass"] == 1
+    msgs = common.sqs.receive_message(QueueUrl=common.REROUTING_QUEUE, MaxNumberOfMessages=10)["Messages"]
+    assert [json.loads(m["Body"])["pass"] for m in msgs] == [2]
+
+
+def test_transaction_conflicts_are_retried_in_place(env, monkeypatch):
+    handler, common, *_ = env
+    from botocore.exceptions import ClientError
+    calls = {"n": 0}
+    real = common.ddb.transact_write_items
+
+    def flaky(**kw):
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            err = ClientError({"Error": {"Code": "TransactionCanceledException", "Message": "conflict"},
+                               "CancellationReasons": [{"Code": "TransactionConflict"}, {"Code": "None"}]},
+                              "TransactWriteItems")
+            err.__class__ = common.ddb.exceptions.TransactionCanceledException
+            raise err
+        return real(**kw)
+    monkeypatch.setattr(common.ddb, "transact_write_items", flaky)
+    common.transact([{"Put": {"TableName": "experiment-runs", "Item": {"pk": {"S": "x"}, "sk": {"S": "y"}}}}])
+    assert calls["n"] == 3

@@ -20,8 +20,8 @@ import json
 import os
 
 from common import (
-    DLQ, RUN_TTL_S, RUNS_TABLE, TERMINAL, cancellation, case_key, close_counters, ddb, dumps, from_ddb,
-    now, run_pk, sqs, to_ddb,
+    DLQ, LEASE_SECONDS, REROUTING_QUEUE, RUN_TTL_S, RUNS_TABLE, TERMINAL, cancellation, case_key, close_counters,
+    ddb, dumps, from_ddb, now, plain_body, run_pk, sqs, to_ddb, transact,
 )
 
 MAX_PER_SWEEP = int(os.environ.get("SWEEP_MAX_MESSAGES", "50"))
@@ -32,14 +32,24 @@ def route_to_person(body, receive_count, t):
     run_id, case_id, pass_no = body["run_id"], body["case_id"], int(body["pass"])
     rec = from_ddb(ddb.get_item(TableName=RUNS_TABLE, Key=to_ddb(case_key(run_id, case_id)),
                                 ConsistentRead=True).get("Item"))
-    if not rec or rec.get("status") in TERMINAL or int(rec.get("pass_no", 0)) != pass_no:
+    if not rec or rec.get("status") in TERMINAL:
         return "already_moved_on"                # a duplicate or stale copy; the record is fine
+    later = int(rec.get("pass_no", 0))
+    if later != pass_no:
+        # This dead letter is for an earlier pass, but the record is waiting on a later one. If
+        # it has waited a while, this may have been the message that would have repaired a lost
+        # handoff: re-send the later pass's message instead of just dropping this one.
+        if rec.get("status") == "queued" and t - float(rec.get("queued_at", t)) >= LEASE_SECONDS:
+            sqs.send_message(QueueUrl=REROUTING_QUEUE, MessageGroupId=run_id,
+                             MessageBody=plain_body(run_id, case_id, later, "dead letter of an earlier pass"))
+            return "requeued_later_pass"
+        return "already_moved_on"
     token = int(rec.get("fencing_token", 0))
     entry = {"p": pass_no, "o": "HUMAN_REVIEW", "r": "dead_lettered", "w": "sweeper", "f": token + 1,
              "c": round(t, 3), "t": round(t, 3), "deliveries": receive_count}
     try:
         # Closing the record and counting it toward its run's progress happen together.
-        ddb.transact_write_items(TransactItems=[
+        transact([
             {"Update": {
                 "TableName": RUNS_TABLE, "Key": to_ddb(case_key(run_id, case_id)),
                 "UpdateExpression": ("SET #st = :hr, resolution = :hro, resolved_at = :t, fencing_token = :next, "
@@ -65,7 +75,8 @@ def route_to_person(body, receive_count, t):
 def sweep():
     depth = int(sqs.get_queue_attributes(QueueUrl=DLQ, AttributeNames=["ApproximateNumberOfMessages"])
                 ["Attributes"]["ApproximateNumberOfMessages"])
-    out = {"dlq_depth": depth, "swept": 0, "already_moved_on": 0, "contended": 0, "unreadable": 0, "errors": 0}
+    out = {"dlq_depth": depth, "swept": 0, "already_moved_on": 0, "requeued_later_pass": 0, "contended": 0,
+           "unreadable": 0, "errors": 0}
     seen = 0
     while depth and seen < MAX_PER_SWEEP:
         msgs = sqs.receive_message(QueueUrl=DLQ, MaxNumberOfMessages=10, WaitTimeSeconds=1, VisibilityTimeout=60,

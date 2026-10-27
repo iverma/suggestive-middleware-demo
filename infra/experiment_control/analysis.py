@@ -156,10 +156,10 @@ def attribute_kills(kills, rows):
 
 EVENT_COUNTERS = ("fenced", "repaired", "stale", "deferred", "duplicates_sent", "throttles_injected",
                   "sdk_retries", "failed_throttled", "failed_poison", "failed_injected", "failed_error", "backoffs",
-                  "own_write_recognized")
+                  "own_write_recognized", "orphans_requeued", "failed_conflict")
 
 
-def incidents(start, rows, kills, zombies, sweeps, limit=60):
+def incidents(start, rows, kills, zombies, sweeps, requeues=(), limit=60):
     """Everything that went wrong and how it was handled, newest first, for the incident feed."""
     out = []
     for k in kills:
@@ -177,6 +177,9 @@ def incidents(start, rows, kills, zombies, sweeps, limit=60):
     for w in sweeps:
         out.append({"t": float(w["swept_at"]), "kind": "swept", "case_id": w["case_id"], "pass": int(w["pass"]),
                     "deliveries": int(w.get("deliveries", 0))})
+    for q in requeues:
+        out.append({"t": float(q["requeued_at"]), "kind": "requeued", "case_id": q["case_id"], "pass": int(q["pass"]),
+                    "status_was": q.get("status_was")})
     for e in out:
         e["at_s"] = round(e.pop("t") - start, 1)
     return sorted(out, key=lambda e: e["at_s"], reverse=True)[:limit]

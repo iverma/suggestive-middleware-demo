@@ -89,7 +89,7 @@
   .runbox dd { margin: 0; font-weight: 700; }
   .runstate { display: inline-block; padding: 2px 8px; border-radius: 3px; font-weight: 700; font-size: .85rem;
               background: var(--line); color: var(--ink); vertical-align: 3px; }
-  .runstate.running, .runstate.starting { background: var(--inflight); color: #1C2A36; }
+  .runstate.running, .runstate.starting, .runstate.recovering { background: var(--inflight); color: #1C2A36; }
   .runstate.complete { background: var(--resolved); color: #fff; }
   .runstate.stalled, .runstate.failed { background: var(--bad); color: #fff; }
 
@@ -140,7 +140,7 @@
   .feed li { display: grid; grid-template-columns: 56px 1fr; gap: 10px; padding: 7px 4px; border-bottom: 1px solid var(--line); font-size: .92rem; }
   .feed .at { font-variant-numeric: tabular-nums; color: var(--muted); }
   .feed .k-crash .what { color: var(--bad); font-weight: 700; }
-  .feed .k-takeover .what, .feed .k-swept .what { color: var(--resolved); font-weight: 700; }
+  .feed .k-takeover .what, .feed .k-swept .what, .feed .k-requeued .what { color: var(--resolved); font-weight: 700; }
   .feed .k-zombie .what { color: var(--human); font-weight: 700; }
   .feed button.case { font: inherit; padding: 0; border: 0; background: none; color: var(--focus); text-decoration: underline; cursor: pointer; }
 </style>
@@ -251,7 +251,7 @@
 <script>
 const $ = (id) => document.getElementById(id);
 let data = null, busy = false, timer = null, selected = null, clockOffset = 0;
-const ACTIVE = ["starting", "running", "stalled"];
+const ACTIVE = ["starting", "running", "stalled", "recovering"];
 const POOLS = [["rebooking", "First-pass workers", "--pool-1"], ["rerouting", "Re-route workers", "--pool-2"]];
 
 function esc(s) { return String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
@@ -490,6 +490,7 @@ function renderFeed(run) {
     if (e.kind === "zombie") return [e.outcome === "fenced" ? "Zombie fenced off" : "Late, uncontested",
       e.outcome === "fenced" ? `${esc(e.worker)} woke up past its lease on ${where} and tried to save; ${esc(e.rival || "another worker")} had taken over, so the write was refused.`
                              : `${esc(e.worker)} saved ${where} after its lease ran out; nobody had taken over, so its result stands.`];
+    if (e.kind === "requeued") return ["Re-queued an orphan", `${where} was ${e.status_was === "queued" ? "waiting" : "held by an expired lease"} with no message left anywhere; its message was sent again.`];
     if (e.kind === "swept") return ["Swept to a person", `${where} failed all ${e.deliveries} deliveries and was dead-lettered; the sweeper sent it to human review.`];
     return [e.kind, where];
   };
@@ -509,7 +510,9 @@ function renderDegradation(run) {
     row("Poison deliveries", d.poison_failures, "Messages that fail every time, retried until the dead-letter queue takes them") +
     row("Other errors caught", d.other_errors, "Unexpected exceptions, logged and retried by the catch-all") +
     row("Own writes recognized", d.own_writes_recognized ?? 0, "A write landed but its response was lost; the retry saw its own result and carried on") +
-    row("Dead-lettered, swept to a person", d.dead_lettered_swept, "The sweeper routed each record to human review with a fenced write");
+    row("Dead-lettered, swept to a person", d.dead_lettered_swept, "The sweeper routed each record to human review with a fenced write") +
+    row("Orphans re-queued", d.orphans_requeued ?? 0, "Open records with no message left anywhere; their message was sent again") +
+    row("Write conflicts after retries", d.conflicts_after_retries ?? 0, "Transactions that still collided after quick in-place retries");
 }
 
 function renderRaces(run) {

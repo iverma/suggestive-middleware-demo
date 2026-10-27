@@ -68,6 +68,30 @@ def close_counters(run_id, pass_no, final_status, t):
     }}
 
 
+def transact(items, attempts=4):
+    """
+    TransactWriteItems, retried in place on TransactionConflict. DynamoDB cancels a transaction
+    that collides with another write to the same item at the same moment, and every closing
+    commit in a run touches that run's META counters, so with 8 workers they do collide. The
+    SDK doesn't retry this, and it isn't worth a 20s message redelivery: back off briefly with
+    jitter and try again. Any other cancellation (a failed condition) is raised immediately.
+    """
+    import random as _r
+    for i in range(attempts):
+        try:
+            return ddb.transact_write_items(TransactItems=items)
+        except ddb.exceptions.TransactionCanceledException as e:
+            codes = [r.get("Code") for r in e.response.get("CancellationReasons", [])]
+            if "TransactionConflict" not in codes or "ConditionalCheckFailed" in codes or i == attempts - 1:
+                raise
+            time.sleep(_r.uniform(0.05, 0.25) * 2 ** i)
+
+
+def plain_body(run_id, case_id, pass_no, why):
+    """A message with no injected faults, for re-queueing work whose message was lost."""
+    return json.dumps({"run_id": run_id, "case_id": case_id, "pass": int(pass_no), "requeued": why})
+
+
 def cancellation(exc):
     """(first failed item's code, the item it returned) from a TransactionCanceledException."""
     reasons = exc.response.get("CancellationReasons", []) or [{}]

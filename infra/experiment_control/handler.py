@@ -42,7 +42,7 @@ from common import (
     LEGACY_RUN_FIELDS, input_columns,
     ACTIVE, ADMISSION_KEY, DLQ, ESMS, FINISHED, INDEX_PK, KEY, LEASE_SECONDS, RECORD_BUDGET,
     MAX_ACTIVE_RUNS, NUMERIC, RECORDS_TABLE, REBOOKING_QUEUE, REROUTING_QUEUE, RUN_KINDS, RUNS_TABLE, TERMINAL,
-    VISIBILITY_SECONDS, WcuPacer, cancellation, case_key, consumed, ddb, dumps, from_ddb, golden,
+    VISIBILITY_SECONDS, WcuPacer, cancellation, case_key, plain_body, transact, consumed, ddb, dumps, from_ddb, golden,
     input_rows, knobs, lam, meta_key, now, outgoing, pace_rate, run_pk, scan_all, sqs, to_ddb, ttl_for,
 )
 
@@ -54,6 +54,12 @@ MAX_THROTTLE_PERCENT = 30 # share of worker AWS calls answered with a 400 thrott
 START_TIMEOUT_S = 120     # a run still "starting" after this never finished its start: fail it
 RUN_MAX_S = 30 * 60       # a run still active after this has stalled: fail it, free its budget
 STALL_S = LEASE_SECONDS + VISIBILITY_SECONDS + 30
+# Orphans: open records whose message is gone (every recovery path for them failed). When the
+# shared queues are completely empty, nothing can still deliver them, so after ORPHAN_S re-send
+# their message. With a backlog in the queues (a load test) only records waiting longer than
+# ORPHAN_BACKLOG_S qualify, so a busy queue doesn't trigger mass re-sends. Duplicates are harmless.
+ORPHAN_S = 90
+ORPHAN_BACKLOG_S = 20 * 60
 GOLDEN_READ_PER_SEC = 4.0 # read units/s spent copying the golden set (its table has 5)
 RESET_SETTLE_S = float(os.environ.get("RESET_SETTLE_S", "4"))
 ESM_RETRY_S = float(os.environ.get("ESM_RETRY_S", "45"))
@@ -251,7 +257,7 @@ def admit(meta, index, client_token=None):
         items.append({"Put": {"TableName": RUNS_TABLE, "ConditionExpression": "attribute_not_exists(pk)",
                               "Item": to_ddb({**token_key, "run_id": meta["run_id"], "ttl": meta["ttl"]})}})
     try:
-        ddb.transact_write_items(TransactItems=items)
+        transact(items)
         return meta["run_id"], None
     except ddb.exceptions.TransactionCanceledException as e:
         reasons = [r.get("Code") for r in e.response.get("CancellationReasons", [])]
@@ -293,7 +299,7 @@ def transition(run_id, status, expect, **extra):
             "UpdateExpression": "DELETE active :id ADD active_records :minus, epoch :one",
             "ExpressionAttributeValues": to_ddb({":id": {run_id}, ":minus": -int(meta.get("records", 0)), ":one": 1})}})
     try:
-        ddb.transact_write_items(TransactItems=items)
+        transact(items)
     except ddb.exceptions.TransactionCanceledException as e:
         if cancellation(e)[0] == "ConditionalCheckFailed":
             return False
@@ -526,6 +532,7 @@ def run_detail(run_id, queues, t):
     rows = [i for i in items if i["sk"].startswith("CASE#")]
     kills = [normalize_kill(i) for i in items if i["sk"].startswith("KILL#")]
     sweeps = sorted((i for i in items if i["sk"].startswith("SWEEP#")), key=lambda i: float(i["swept_at"]))
+    requeues = [i for i in items if i["sk"].startswith("REQUEUE#")]
     events = next((i for i in items if i["sk"] == "EVENTS"), {})
     started = float(meta["started_at"])
     gold = golden()
@@ -599,6 +606,8 @@ def run_detail(run_id, queues, t):
             "other_errors": int(events.get("failed_error", 0)),
             "own_writes_recognized": int(events.get("own_write_recognized", 0)),
             "dead_lettered_swept": len(sweeps),
+            "orphans_requeued": int(events.get("orphans_requeued", 0)),
+            "conflicts_after_retries": int(events.get("failed_conflict", 0)),
         },
         "workers_busy_now": activity["busy_now"], "workers_peak": activity["peak"],
         "workers_used": activity["used"], "first_claim_s": activity["first_claim_s"],
@@ -614,13 +623,52 @@ def run_detail(run_id, queues, t):
                         UpdateExpression="SET #f = :true", ExpressionAttributeNames={"#f": "final"},
                         ExpressionAttributeValues=to_ddb({":true": True}))
     shown = status
-    if (status == "running" and open_rows and t - last_activity > STALL_S
-            and not any(q["visible"] + q["in_flight"] for q in queues.values())):
-        shown = "stalled"                       # open records but nothing happening: shown, not hidden
+    if status == "running" and open_rows and t - last_activity > STALL_S:
+        if requeue_orphans(run_id, open_rows, queues, t):
+            shown = "recovering"                # orphans found and re-sent just now
+        elif not any(q["visible"] + q["in_flight"] for q in queues.values()):
+            shown = "stalled"                   # open records but nothing happening: shown, not hidden
     meta_out = {k: v for k, v in meta.items() if k not in ("pk", "sk", "closed_by_pass")}
     return {**meta_out, "status": shown, "stats": stats, "workers": activity["workers"],
-            "incidents": incidents(started, rows, fired, stats["races"]["zombie_list"], sweeps),
+            "incidents": incidents(started, rows, fired, stats["races"]["zombie_list"], sweeps, requeues),
             "sweeps": sweeps, "timeline": activity["timeline"], "kills": fired, "records": table}
+
+
+def requeue_orphans(run_id, rows, queues, t):
+    """Re-send the message for open records nothing can deliver any more. At most once a minute per run."""
+    empty = not any(q["visible"] + q["in_flight"] for name, q in queues.items() if name != "dead_letter")
+    limit = ORPHAN_S if empty else ORPHAN_BACKLOG_S
+    orphans = []
+    for r in rows:
+        st, waited = r.get("status"), None
+        if st == "queued":
+            waited = t - float(r.get("queued_at", t))
+        elif st == "in_progress":
+            waited = t - float(r.get("lease_expires", t))         # lease long gone, nobody took over
+        if waited is not None and waited > limit:
+            orphans.append(r)
+    if not orphans:
+        return 0
+    try:                                         # one caller per minute per run (UI tabs, housekeeping)
+        ddb.update_item(TableName=RUNS_TABLE, Key=to_ddb(meta_key(run_id)),
+                        UpdateExpression="SET last_requeue_at = :t",
+                        ConditionExpression="attribute_not_exists(last_requeue_at) OR last_requeue_at < :cut",
+                        ExpressionAttributeValues=to_ddb({":t": round(t, 3), ":cut": round(t - 60, 3)}))
+    except ddb.exceptions.ConditionalCheckFailedException:
+        return 0
+    for r in orphans:
+        p = int(r.get("pass_no", 1))
+        sqs.send_message(QueueUrl=REBOOKING_QUEUE if p == 1 else REROUTING_QUEUE, MessageGroupId=run_id,
+                         MessageBody=plain_body(run_id, r[KEY], p, "orphan: no message left for this record"))
+        ddb.put_item(TableName=RUNS_TABLE, Item=to_ddb({
+            "pk": run_pk(run_id), "sk": f"REQUEUE#{r[KEY]}#{p}#{int(t)}", "case_id": r[KEY], "pass": p,
+            "requeued_at": round(t, 3), "status_was": r.get("status"), "ttl": int(t + 86400)}))
+    ddb.update_item(TableName=RUNS_TABLE, Key=to_ddb({"pk": run_pk(run_id), "sk": "EVENTS"}),
+                    UpdateExpression="SET #ttl = if_not_exists(#ttl, :ttl) ADD orphans_requeued :n",
+                    ExpressionAttributeNames={"#ttl": "ttl"},
+                    ExpressionAttributeValues=to_ddb({":n": len(orphans), ":ttl": int(t + 86400)}))
+    print(dumps({"requeued_orphans": [(r[KEY], r.get("pass_no"), r.get("status")) for r in orphans], "run_id": run_id}))
+    return len(orphans)
 
 
 # --- housekeeping --------------------------------------------------------------
@@ -659,6 +707,16 @@ def _housekeeping():
             actions[run_id] = "complete"
         else:
             oldest_progress = max(oldest_progress, t - float(meta.get("last_progress_at", started)))
+            if meta["status"] == "running" and t - float(meta.get("last_progress_at", started)) > ORPHAN_S:
+                open_rows = [r for r in query_all(
+                    KeyConditionExpression="pk = :p AND begins_with(sk, :c)",
+                    ProjectionExpression="case_id, #st, pass_no, queued_at, lease_expires",
+                    ExpressionAttributeNames={"#st": "status"},
+                    ExpressionAttributeValues=to_ddb({":p": run_pk(run_id), ":c": "CASE#"}))
+                    if r.get("status") not in TERMINAL]
+                n = requeue_orphans(run_id, open_rows, queue_depths(), t)
+                if n:
+                    actions[run_id] = f"requeued {n} orphans"
     mappings = safe_reconcile()
     # Custom metric for the stuck-run alarm, via CloudWatch embedded metric format (a log line,
     # no API call): seconds since any active run last closed a record. 0 when nothing is active.
