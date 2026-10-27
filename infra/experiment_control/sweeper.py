@@ -20,7 +20,8 @@ import json
 import os
 
 from common import (
-    DLQ, RECORDS_TABLE, RUNS_TABLE, TERMINAL, ddb, dumps, from_ddb, now, sqs, to_ddb,
+    DLQ, RUN_TTL_S, RUNS_TABLE, TERMINAL, cancellation, case_key, close_counters, ddb, dumps, from_ddb,
+    now, run_pk, sqs, to_ddb,
 )
 
 MAX_PER_SWEEP = int(os.environ.get("SWEEP_MAX_MESSAGES", "50"))
@@ -29,29 +30,35 @@ MAX_PER_SWEEP = int(os.environ.get("SWEEP_MAX_MESSAGES", "50"))
 def route_to_person(body, receive_count, t):
     """Fenced write: returns 'swept', 'already_moved_on' or 'contended'."""
     run_id, case_id, pass_no = body["run_id"], body["case_id"], int(body["pass"])
-    rec = from_ddb(ddb.get_item(TableName=RECORDS_TABLE, Key=to_ddb({"case_id": case_id}),
+    rec = from_ddb(ddb.get_item(TableName=RUNS_TABLE, Key=to_ddb(case_key(run_id, case_id)),
                                 ConsistentRead=True).get("Item"))
-    if (not rec or rec.get("run_id") != run_id or rec.get("status") in TERMINAL
-            or int(rec.get("pass_no", 0)) != pass_no):
+    if not rec or rec.get("status") in TERMINAL or int(rec.get("pass_no", 0)) != pass_no:
         return "already_moved_on"                # a duplicate or stale copy; the record is fine
     token = int(rec.get("fencing_token", 0))
     entry = {"p": pass_no, "o": "HUMAN_REVIEW", "r": "dead_lettered", "w": "sweeper", "f": token + 1,
              "c": round(t, 3), "t": round(t, 3), "deliveries": receive_count}
     try:
-        ddb.update_item(
-            TableName=RECORDS_TABLE, Key=to_ddb({"case_id": case_id}),
-            UpdateExpression=("SET #st = :hr, resolution = :hro, resolved_at = :t, fencing_token = :next, "
-                              "history = list_append(history, :h), swept = :true REMOVE lease_owner, lease_expires"),
-            ConditionExpression="fencing_token = :tok AND run_id = :run AND pass_no = :p",
-            ExpressionAttributeNames={"#st": "status"},
-            ExpressionAttributeValues=to_ddb({":hr": "human_review", ":hro": "HUMAN_REVIEW", ":t": round(t, 3),
-                                              ":next": token + 1, ":tok": token, ":run": run_id, ":p": pass_no,
-                                              ":h": [entry], ":true": True}))
-    except ddb.exceptions.ConditionalCheckFailedException:
-        return "contended"                       # a worker touched it since the read; next sweep decides
+        # Closing the record and counting it toward its run's progress happen together.
+        ddb.transact_write_items(TransactItems=[
+            {"Update": {
+                "TableName": RUNS_TABLE, "Key": to_ddb(case_key(run_id, case_id)),
+                "UpdateExpression": ("SET #st = :hr, resolution = :hro, resolved_at = :t, fencing_token = :next, "
+                                     "history = list_append(history, :h), swept = :true "
+                                     "REMOVE lease_owner, lease_expires"),
+                "ConditionExpression": "fencing_token = :tok AND pass_no = :p",
+                "ExpressionAttributeNames": {"#st": "status"},
+                "ExpressionAttributeValues": to_ddb({":hr": "human_review", ":hro": "HUMAN_REVIEW",
+                                                     ":t": round(t, 3), ":next": token + 1, ":tok": token,
+                                                     ":p": pass_no, ":h": [entry], ":true": True})}},
+            close_counters(run_id, pass_no, "human_review", t)])
+    except ddb.exceptions.TransactionCanceledException as e:
+        if cancellation(e)[0] == "ConditionalCheckFailed":
+            return "contended"                   # a worker touched it since the read; next sweep decides
+        raise
     ddb.put_item(TableName=RUNS_TABLE, Item=to_ddb({
-        "pk": f"RUN#{run_id}", "sk": f"SWEEP#{case_id}#{pass_no}", "case_id": case_id, "pass": pass_no,
-        "swept_at": round(t, 3), "deliveries": receive_count, "poison": bool(body.get("poison"))}))
+        "pk": run_pk(run_id), "sk": f"SWEEP#{case_id}#{pass_no}", "case_id": case_id, "pass": pass_no,
+        "swept_at": round(t, 3), "deliveries": receive_count, "poison": bool(body.get("poison")),
+        "ttl": int(t + RUN_TTL_S)}))
     return "swept"
 
 

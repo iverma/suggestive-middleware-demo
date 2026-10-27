@@ -10,8 +10,69 @@ import boto3
 from boto3.dynamodb.types import TypeDeserializer, TypeSerializer
 from botocore.config import Config
 
+# customer-records-db: the customer records themselves (the golden inputs), keyed by case_id.
+# Runs never write here: each run copies the records it needs into its own partition below.
 RECORDS_TABLE = os.environ["TABLE_NAME"]
+# experiment-runs: everything about runs, single-table, one partition per run so concurrent runs
+# (experiments, load tests, several people or tabs) never share a row:
+#   RUN#<run_id> / META           settings, status, exactly-once progress counters
+#   RUN#<run_id> / CASE#<case_id> the run's working copy of a record: lease, fencing token, history
+#   RUN#<run_id> / EVENTS, KILL#, ZOMBIE#, SWEEP#   telemetry
+#   RUNS / <iso time>#<run_id>    index of runs, newest first
+#   CONTROL / ADMISSION           the set of active runs (admission control, worker on/off)
+# Every run item carries a ttl: DynamoDB deletes it (free) a day after the run started.
 RUNS_TABLE = os.environ.get("RUNS_TABLE", "")
+RUN_TTL_S = int(os.environ.get("RUN_TTL_S", str(24 * 3600)))
+# Admission control: every kind of run (chaos experiments, integration checks, load tests) shares
+# one budget, because they share the same workers, queues and table capacity. A run is admitted
+# only if both limits hold: active runs < MAX_ACTIVE_RUNS and records in flight + its records
+# <= RECORD_BUDGET (sized for one 1,000-record load test alongside three 100-record runs).
+MAX_ACTIVE_RUNS = int(os.environ.get("MAX_ACTIVE_RUNS", "6"))
+RECORD_BUDGET = int(os.environ.get("RECORD_BUDGET", "1300"))
+RUN_KINDS = ("chaos", "integration", "load")
+ACTIVE = ("starting", "running")
+FINISHED = ("complete", "failed", "cancelled")
+INDEX_PK = "RUNS"
+ADMISSION_KEY = {"pk": "CONTROL", "sk": "ADMISSION"}
+
+
+def run_pk(run_id):
+    return f"RUN#{run_id}"
+
+
+def case_key(run_id, case_id):
+    return {"pk": run_pk(run_id), "sk": f"CASE#{case_id}"}
+
+
+def meta_key(run_id):
+    return {"pk": run_pk(run_id), "sk": "META"}
+
+
+def ttl_for(started_at):
+    return int(float(started_at) + RUN_TTL_S)
+
+
+def close_counters(run_id, pass_no, final_status, t):
+    """
+    The run-progress half of a closing commit. It goes in the SAME transaction as the record's
+    final write, so each record is counted exactly once however many workers, duplicates or
+    retries touch it: a run's completion and its load-test summary come from these counters
+    alone, without reading the records.
+    """
+    return {"Update": {
+        "TableName": RUNS_TABLE, "Key": to_ddb(meta_key(run_id)),
+        "UpdateExpression": ("SET closed_by_pass.#pn = if_not_exists(closed_by_pass.#pn, :zero) + :one, "
+                             "last_progress_at = :t ADD closed :one, #fs :one, passes_total :p"),
+        "ExpressionAttributeNames": {"#pn": str(pass_no), "#fs": final_status},
+        "ExpressionAttributeValues": to_ddb({":one": 1, ":zero": 0, ":p": int(pass_no), ":t": round(t, 3)}),
+    }}
+
+
+def cancellation(exc):
+    """(first failed item's code, the item it returned) from a TransactionCanceledException."""
+    reasons = exc.response.get("CancellationReasons", []) or [{}]
+    first = next((r for r in reasons if r.get("Code") not in (None, "None")), reasons[0])
+    return first.get("Code"), from_ddb(first.get("Item"))
 TABLE_WCU = float(os.environ.get("TABLE_WCU", "10"))
 DEFAULT_WCU_PER_SEC = float(os.environ.get("DEFAULT_WCU_PER_SEC", "8"))
 REBOOKING_QUEUE = os.environ.get("REBOOKING_QUEUE_URL", "")
@@ -155,6 +216,17 @@ def input_rows(path=CSV_PATH):
         for raw in reader:
             yield dict(zip(cols, raw[: len(cols)]))
 
+
+def input_columns(path=CSV_PATH):
+    """The customer-record columns (everything before the golden answers)."""
+    with open(path, newline="") as f:
+        header = next(csv.reader(f))
+    return header[: header.index(STOP_AT)]
+
+
+# Fields earlier versions wrote onto customer-records-db when runs worked on it directly.
+LEGACY_RUN_FIELDS = ("fencing_token", "status", "pass_no", "history", "run_id", "lease_owner", "lease_expires",
+                     "claimed_at", "claims", "queued_at", "resolution", "resolved_at", "swept")
 
 _golden = None
 

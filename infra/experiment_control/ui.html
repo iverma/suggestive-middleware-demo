@@ -125,6 +125,17 @@
   #detail { background: var(--panel); border-left: 4px solid var(--ink); padding: 12px 14px; margin-top: 14px; }
   #detail[hidden] { display: none; }
   #detail ol { margin: 6px 0 0; padding-left: 22px; }
+  .active-runs { margin-top: 18px; display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; }
+  .budget { color: var(--muted); font-size: .9rem; }
+  .run-chips { display: flex; flex-wrap: wrap; gap: 8px; }
+  .run-chip { font: inherit; font-size: .88rem; padding: 6px 10px; border-radius: 4px; border: 1px solid var(--line);
+              background: var(--panel); color: var(--ink); cursor: pointer; text-align: left; }
+  .run-chip[aria-current="true"] { border-color: var(--ink); box-shadow: inset 0 0 0 1px var(--ink); }
+  .run-chip .meter { display: block; height: 4px; margin-top: 4px; background: var(--line); border-radius: 2px; overflow: hidden; }
+  .run-chip .meter i { display: block; height: 100%; background: var(--resolved); }
+  .run-chip .mine { color: var(--focus); font-weight: 700; }
+  tr.viewing td { background: var(--panel); }
+  #runs-t tr[data-run] { cursor: pointer; }
   .feed { list-style: none; margin: 0; padding: 0; max-height: 360px; overflow-y: auto; border-top: 1px solid var(--line); }
   .feed li { display: grid; grid-template-columns: 56px 1fr; gap: 10px; padding: 7px 4px; border-bottom: 1px solid var(--line); font-size: .92rem; }
   .feed .at { font-variant-numeric: tabular-nums; color: var(--muted); }
@@ -139,7 +150,7 @@
   <header>
     <div>
       <h1>MSP re-booking desk</h1>
-      <p class="sub">Winter-storm cancellations, re-booked by workers that scale with the queue. Crash a share of them at any step: every record should still end accepted or with a person, none lost.</p>
+      <p class="sub">Winter-storm cancellations, re-booked by workers that scale with the queue. Crash a share of them at any step: every record should still end accepted or with a person, none lost. Several runs can go at once, from any tab; each works on its own copy of the records.</p>
     </div>
     <form class="controls" id="controls">
       <label>Reject % <input type="number" id="reject" min="0" max="100" value="50"></label>
@@ -149,11 +160,17 @@
       <label>Poison % <input type="number" id="poison" min="0" max="10" value="0"></label>
       <label>Throttle % <input type="number" id="throttle" min="0" max="30" value="0"></label>
       <button type="submit" class="primary" id="btn-run">Start run</button>
+      <button type="button" id="btn-cancel" hidden>Cancel this run</button>
       <button type="button" id="btn-load">Load records</button>
-      <button type="button" id="btn-reset">Reset</button>
+      <button type="button" id="btn-reset">Reset everything</button>
     </form>
   </header>
   <p id="status" role="status" aria-live="polite"></p>
+
+  <section class="active-runs" aria-label="Runs in progress">
+    <div class="budget" id="budget"></div>
+    <div class="run-chips" id="run-chips"></div>
+  </section>
 
   <div class="hero">
     <div>
@@ -246,6 +263,19 @@ function when(t) { return t ? new Date(t * 1000).toLocaleTimeString() : "–"; }
 function say(msg, err) { $("status").textContent = msg; $("status").className = err ? "err" : ""; }
 function css(v) { return getComputedStyle(document.documentElement).getPropertyValue(v).trim(); }
 
+// Which run this tab is looking at: ?run=<id> in the URL, so each tab can follow its own run.
+let viewing = new URLSearchParams(location.search).get("run");
+const mine = new Set(JSON.parse(sessionStorageGet("my-runs") || "[]"));
+function sessionStorageGet(k) { try { return sessionStorage.getItem(k); } catch (e) { return null; } }
+function sessionStorageSet(k, v) { try { sessionStorage.setItem(k, v); } catch (e) {} }
+function view(runId) {
+  viewing = runId; selected = null;
+  const u = new URL(location.href);
+  if (runId) u.searchParams.set("run", runId); else u.searchParams.delete("run");
+  history.replaceState(null, "", u);
+  refresh();
+}
+
 async function call(path, label) {
   if (busy) return;
   busy = true; document.querySelectorAll("button").forEach(b => b.disabled = true);
@@ -254,9 +284,13 @@ async function call(path, label) {
     const r = await fetch(path, { method: "POST" });
     const body = await r.json();
     if (!r.ok) throw new Error(body.error || r.statusText);
-    if (path.startsWith("/run")) say(`Run ${body.run_id} started: ${body.reject_percent}% rejections; ${body.kill_percent}% of worker passes crash, ${body.slow_percent}% run slow, ${body.dup_percent}% are delivered twice, ${body.poison_percent}% are poison, ${body.throttle_percent}% of AWS calls are throttled; workers ${body.workers}.`);
-    else if (path === "/load") say(`Loaded ${body.loaded} records in ${body.seconds}s (${body.wcu_per_sec_actual} write units/s).`);
-    else say(`Reset: deleted ${body.deleted_records} records and ${body.deleted_run_items} run items. Workers switched off.`);
+    if (path.startsWith("/run")) {
+      mine.add(body.run_id); sessionStorageSet("my-runs", JSON.stringify([...mine]));
+      say(`${body.duplicate ? "Already started" : "Started"} ${body.run_id}: ${body.reject_percent}% rejections; ${body.kill_percent}% of worker passes crash, ${body.slow_percent}% run slow, ${body.dup_percent}% are delivered twice, ${body.poison_percent}% are poison, ${body.throttle_percent}% of AWS calls are throttled. Workers ${body.workers}.`);
+      viewing = body.run_id; view(body.run_id);
+    } else if (path === "/load") say(`Loaded ${body.loaded} records into customer-records-db in ${body.seconds}s.`);
+    else if (path.startsWith("/cancel")) say(`Cancelled ${body.run_id}. Other runs carry on.`);
+    else say(`Reset everything: cancelled ${body.cancelled_runs.length} runs, deleted ${body.deleted_run_items} run items, emptied the queues. Customer records kept.`);
   } catch (e) { say(`${label} failed: ${e.message}`, true); }
   finally { busy = false; document.querySelectorAll("button").forEach(b => b.disabled = false); refresh(); }
 }
@@ -265,11 +299,26 @@ $("controls").addEventListener("submit", (e) => {
   e.preventDefault();
   const q = new URLSearchParams({ reject_percent: $("reject").value, kill_percent: $("kill").value,
                                  slow_percent: $("slow").value, dup_percent: $("dup").value,
-                                 poison_percent: $("poison").value, throttle_percent: $("throttle").value });
+                                 poison_percent: $("poison").value, throttle_percent: $("throttle").value,
+                                 kind: "chaos", client_token: crypto.randomUUID() });   // one token per click
   call(`/run?${q}`, "Starting run");
 });
 $("btn-load").onclick = () => call("/load", "Loading records");
-$("btn-reset").onclick = () => { if (confirm("Delete all records and run history?")) call("/reset", "Resetting"); };
+$("btn-cancel").onclick = () => { if (viewing && confirm(`Cancel ${viewing}? Other runs are not affected.`)) call(`/cancel?run=${encodeURIComponent(viewing)}`, "Cancelling"); };
+$("btn-reset").onclick = () => { if (confirm("Cancel EVERY run for everyone, empty the queues and delete all run data? Customer records are kept.")) call("/reset?confirm=everything", "Resetting everything"); };
+
+function renderActive(d) {
+  const b = d.budget || {};
+  $("budget").textContent = `Running: ${b.runs ?? 0} of ${b.max_runs ?? "–"} runs, ${b.records ?? 0} of ${b.max_records ?? "–"} records in flight`;
+  const runs = d.active_runs || [];
+  $("run-chips").innerHTML = runs.map(r => {
+    const pct = r.records ? Math.round(100 * (r.closed || 0) / r.records) : 0;
+    return `<button class="run-chip" data-run="${esc(r.run_id)}" aria-current="${r.run_id === (d.latest_run && d.latest_run.run_id)}">
+      ${mine.has(r.run_id) ? `<span class="mine">yours</span> ` : ""}${esc(r.kind || "chaos")} ${esc(r.run_id.slice(-6))}: ${r.closed || 0} of ${r.records} closed
+      <span class="meter"><i style="width:${pct}%"></i></span></button>`;
+  }).join("") || `<span class="empty-note">No runs in progress.</span>`;
+  $("run-chips").querySelectorAll("button.run-chip").forEach(c => c.onclick = () => view(c.dataset.run));
+}
 
 // --- live run clock ------------------------------------------------------------
 function elapsed(run) {
@@ -328,7 +377,7 @@ function renderRunbox(run, maps) {
   if (s.queued_s != null) notes.push(`All ${s.records} records queued at ${s.queued_s}s`);
   if (s.first_claim_s != null) notes.push(`First worker picked one up at ${s.first_claim_s}s`);
   $("runbox").innerHTML = `
-    <h2>Latest run <span class="runstate ${esc(run.status)}">${esc(run.status)}</span></h2>
+    <h2>${mine.has(run.run_id) ? "Your run" : "Run"} <span class="runstate ${esc(run.status)}">${esc(run.status)}</span></h2>
     <div class="clock" id="run-clock" aria-label="Processing time">${clock(elapsed(run))}</div>
     <p class="clock-note">${notes.map(esc).join(". ") || "Preparing records…"}</p>
     <div class="workers-now"><span class="n">${s.workers_busy_now}</span><span>workers busy now</span></div>
@@ -346,7 +395,7 @@ function renderRunbox(run, maps) {
       <dt>Lost handoffs repaired</dt><dd>${s.events.repaired}</dd>
       <dt>Late writes fenced off</dt><dd>${s.events.fenced}</dd>
     </dl>
-    <p class="empty-note" style="margin-top:10px">${esc(run.run_id)}: ${run.reject_percent}% rejections; ${run.kill_percent ?? 0}% crash, ${run.slow_percent ?? 0}% slow, ${run.dup_percent ?? 0}% duplicated, ${run.poison_percent ?? 0}% poison, ${run.throttle_percent ?? 0}% throttled.</p>`;
+    <p class="empty-note" style="margin-top:10px">${esc(run.kind || "chaos")} run ${esc(run.run_id)}${run.error ? ` (${esc(run.error)})` : ""}: ${run.reject_percent}% rejections; ${run.kill_percent ?? 0}% crash, ${run.slow_percent ?? 0}% slow, ${run.dup_percent ?? 0}% duplicated, ${run.poison_percent ?? 0}% poison, ${run.throttle_percent ?? 0}% throttled.</p>`;
 }
 
 // --- workers-over-time chart ---------------------------------------------------
@@ -518,9 +567,10 @@ function renderWorkers(run) {
 }
 
 function renderRuns(runs) {
-  $("runs-t").innerHTML = runs.length ? `<tr><th>Run</th><th>Started</th><th>State</th><th class="n">Reject %</th><th class="n">Crash %</th><th class="n">Slow %</th><th class="n">Dup %</th><th class="n">Crashes</th><th class="n">Fenced</th><th class="n">Double results</th>
+  const cur = data && data.latest_run && data.latest_run.run_id;
+  $("runs-t").innerHTML = runs.length ? `<tr><th>Run</th><th>Kind</th><th>Started</th><th>State</th><th class="n">Reject %</th><th class="n">Crash %</th><th class="n">Slow %</th><th class="n">Dup %</th><th class="n">Crashes</th><th class="n">Fenced</th><th class="n">Double results</th>
       <th class="n">Peak workers</th><th class="n">Accepted</th><th class="n">In golden set</th><th class="n">To a person</th><th class="n">Avg passes</th><th class="n">Took</th></tr>` +
-    runs.map(r => { const f = r.final || {}; return `<tr><td>${esc(r.run_id)}</td><td>${when(r.started_at)}</td><td>${esc(r.status)}</td>
+    runs.map(r => { const f = r.final || {}; return `<tr data-run="${esc(r.run_id)}" class="${r.run_id === cur ? "viewing" : ""}"><td>${mine.has(r.run_id) ? "<b>yours</b> " : ""}${esc(r.run_id)}</td><td>${esc(r.kind || "chaos")}</td><td>${when(r.started_at)}</td><td>${esc(r.status)}${r.error ? `<div class="offers">${esc(r.error)}</div>` : ""}</td>
       <td class="n">${r.reject_percent}</td><td class="n">${r.kill_percent ?? "–"}</td>
       <td class="n">${r.slow_percent ?? "–"}</td><td class="n">${r.dup_percent ?? "–"}</td>
       <td class="n">${f.kills_fired != null ? `${f.kills_recovered ?? f.kills_fired}/${f.kills_fired}` : "–"}</td>
@@ -529,6 +579,7 @@ function renderRuns(runs) {
       <td class="n">${f.resolved ?? "–"}</td><td class="n">${f.satisfactory ?? "–"}</td><td class="n">${f.human_review ?? "–"}</td>
       <td class="n">${f.avg_passes ?? "–"}</td><td class="n">${f.duration_s != null ? clock(f.duration_s) : "–"}</td></tr>`; }).join("")
     : `<tr><td class="empty-note">No runs yet.</td></tr>`;
+  $("runs-t").querySelectorAll("tr[data-run]").forEach(tr => tr.onclick = () => view(tr.dataset.run));
 }
 
 function renderRecords(run) {
@@ -545,17 +596,19 @@ async function refresh() {
   clearTimeout(timer);
   try {
     const sent = Date.now();
-    const r = await fetch("/results", { cache: "no-store" });
+    const r = await fetch(viewing ? `/results?run=${encodeURIComponent(viewing)}` : "/results", { cache: "no-store" });
     data = await r.json();
     if (!r.ok) throw new Error(data.error || r.statusText);
     clockOffset = data.generated_at * 1000 - (sent + Date.now()) / 2;   // server clock vs this browser
     const run = data.latest_run;
+    renderActive(data);
+    $("btn-cancel").hidden = !(run && ACTIVE.includes(run.status));
     renderBoard(run, data.records_in_table); renderRunbox(run, data.worker_mappings);
     renderChart(run, data.worker_mappings); renderPasses(run); renderQueues(data.queues, data.worker_mappings);
     renderWorkers(run); renderFeed(run); renderDegradation(run); renderCrashes(run); renderRaces(run); renderRuns(data.recent_runs || []); renderRecords(run); renderDetail(); tick();
     if (!run && !busy) say(data.records_in_table ? `${data.records_in_table} records loaded. Start a run.` : "No records loaded. Load records to begin.");
   } catch (e) { say(`Couldn't read results: ${e.message}`, true); }
-  const live = data && data.latest_run && ACTIVE.includes(data.latest_run.status);
+  const live = data && ((data.latest_run && ACTIVE.includes(data.latest_run.status)) || (data.active_runs || []).length);
   timer = setTimeout(refresh, live ? 2000 : 10000);
 }
 refresh();

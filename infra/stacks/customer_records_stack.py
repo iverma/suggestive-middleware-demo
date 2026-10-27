@@ -5,12 +5,16 @@ from pathlib import Path
 from aws_cdk import (
     CfnOutput, CustomResource, Duration, RemovalPolicy, Stack,
     aws_dynamodb as dynamodb,
+    aws_cloudwatch as cw,
+    aws_cloudwatch_actions as cw_actions,
     aws_iam as iam,
     aws_lambda as lambda_,
     aws_lambda_event_sources as sources,
     aws_logs as logs,
     aws_scheduler as scheduler,
     aws_scheduler_targets as scheduler_targets,
+    aws_sns as sns,
+    aws_sns_subscriptions as subs,
     aws_sqs as sqs,
 )
 from constructs import Construct
@@ -19,14 +23,29 @@ ROOT = Path(__file__).resolve().parents[2]
 CSV = ROOT / "golden_set" / "golden_set_irops_msp.csv"
 SRC = ROOT / "infra" / "experiment_control"
 BUILD = ROOT / "infra" / ".build" / "experiment_control"
-RUNTIME_FILES = ["common.py", "handler.py", "worker.py", "sweeper.py", "throttle.py", "ui.html"]
+RUNTIME_FILES = ["common.py", "handler.py", "analysis.py", "worker.py", "sweeper.py", "throttle.py", "ui.html"]
 
 # Free tier: 25 provisioned RCU + 25 provisioned WCU per account, across ALL tables.
 # Provisioned capacity is what's billed, so these numbers ARE the cost ceiling: no
 # workload can push DynamoDB past them, it gets throttled instead. Total here: 20 / 20.
-RECORDS_RCU, RECORDS_WCU = 15, 15
-RUNS_RCU, RUNS_WCU = 5, 5
-PACE_WCU_PER_SEC = 12          # loads, resets and run start stay under the records table's 15
+# customer-records-db only holds the customer inputs now (written by /load, read when a run
+# starts); every run works on its own copy in experiment-runs, which takes the rest. 25 / 25.
+RECORDS_RCU, RECORDS_WCU = 5, 5
+RUNS_RCU, RUNS_WCU = 20, 20
+LOAD_WCU_PER_SEC = 4           # /load into customer-records-db (5)
+RUN_INIT_WCU_PER_SEC = 12      # copying records into a run (experiment-runs, 20)
+
+# Admission budget shared by every kind of run (chaos, integration, later load tests).
+MAX_ACTIVE_RUNS = 6
+RECORD_BUDGET = 1300           # records in flight: one 1,000-record load test + three 100-record runs
+RUN_TTL_S = 24 * 3600          # DynamoDB deletes run data (free) a day after the run started
+
+ALARM_EMAIL = "verma.esha@gmail.com"
+# Alarm thresholds derive from the limits above, so changing a limit moves its alarm.
+ALARM_BACKLOG = 1000           # messages waiting in the rebooking queue
+ALARM_MESSAGE_AGE_S = 600      # oldest message in a work queue (longest planned backoff is 300s)
+ALARM_CAPACITY_SHARE = 0.8     # of the experiment-runs table's provisioned capacity
+ALARM_NO_PROGRESS_S = 600      # an active run that closed nothing for this long is stuck
 
 # Worker timing: a worker invoke handles one message in ~1-2s and can never outlive WORKER_TIMEOUT.
 # The lease must be shorter than the visibility timeout, so that when SQS redelivers a crashed
@@ -43,6 +62,7 @@ VISIBILITY_SECONDS = 20
 REBOOKING_MAX_WORKERS = 5
 REROUTING_MAX_WORKERS = 3
 CONTROL_FN = "effect-demo-experiment-control"
+LOAD_SCHEMA_VERSION = "2: inputs only; run fields live on each run's copy"
 SWEEPER_FN = "effect-demo-sweeper"
 # Deliveries before a message is dead-lettered (crashes, held-back duplicates and backoffs all
 # count). 5 x 20s visibility puts a poison message in the DLQ within ~2 minutes.
@@ -58,10 +78,11 @@ def stage_runtime():
     for f in RUNTIME_FILES:
         shutil.copy(SRC / f, BUILD / f)
     shutil.copy(CSV, BUILD / CSV.name)
-    return hashlib.sha256(CSV.read_bytes()).hexdigest()[:16]
+    # The schema version is part of the hash, so a change to what /load writes reloads on deploy.
+    return hashlib.sha256(CSV.read_bytes() + LOAD_SCHEMA_VERSION.encode()).hexdigest()[:16]
 
 
-def provisioned_table(scope, cid, name, pk, sk=None, rcu=5, wcu=5):
+def provisioned_table(scope, cid, name, pk, sk=None, rcu=5, wcu=5, ttl=None):
     return dynamodb.Table(
         scope, cid, table_name=name,
         partition_key=dynamodb.Attribute(name=pk, type=dynamodb.AttributeType.STRING),
@@ -72,6 +93,7 @@ def provisioned_table(scope, cid, name, pk, sk=None, rcu=5, wcu=5):
             point_in_time_recovery_enabled=False),         # PITR is billed per GB
         encryption=dynamodb.TableEncryption.DEFAULT,      # AWS-owned key, no KMS charge
         removal_policy=RemovalPolicy.DESTROY,             # demo: tearing down leaves nothing billing
+        time_to_live_attribute=ttl,                       # TTL deletes are free
     )
 
 
@@ -82,7 +104,7 @@ class CustomerRecordsStack(Stack):
         records = provisioned_table(self, "CustomerRecordsDb", "customer-records-db", "case_id",
                                     rcu=RECORDS_RCU, wcu=RECORDS_WCU)
         runs = provisioned_table(self, "ExperimentRuns", "experiment-runs", "pk", "sk",
-                                 rcu=RUNS_RCU, wcu=RUNS_WCU)
+                                 rcu=RUNS_RCU, wcu=RUNS_WCU, ttl="ttl")
 
         # SQS: 1M requests/month always free. Queue-managed encryption is free.
         dlq = sqs.Queue(self, "DeadLetter", queue_name="effect-demo-dead-letter",
@@ -98,8 +120,10 @@ class CustomerRecordsStack(Stack):
         code = lambda_.Code.from_asset(str(BUILD))
         env = {
             "TABLE_NAME": records.table_name, "RUNS_TABLE": runs.table_name,
-            "TABLE_WCU": str(RECORDS_WCU), "DEFAULT_WCU_PER_SEC": str(PACE_WCU_PER_SEC),
-            "RUN_INIT_WCU_PER_SEC": str(PACE_WCU_PER_SEC), "LEASE_SECONDS": str(LEASE_SECONDS),
+            "TABLE_WCU": str(RUNS_WCU), "DEFAULT_WCU_PER_SEC": str(LOAD_WCU_PER_SEC),
+            "RUN_INIT_WCU_PER_SEC": str(RUN_INIT_WCU_PER_SEC), "LEASE_SECONDS": str(LEASE_SECONDS),
+            "MAX_ACTIVE_RUNS": str(MAX_ACTIVE_RUNS), "RECORD_BUDGET": str(RECORD_BUDGET),
+            "RUN_TTL_S": str(RUN_TTL_S),
             "VISIBILITY_SECONDS": str(VISIBILITY_SECONDS),
             "REBOOKING_QUEUE_URL": rebooking.queue_url, "REROUTING_QUEUE_URL": rerouting.queue_url,
             "DLQ_URL": dlq.queue_url,
@@ -163,8 +187,7 @@ class CustomerRecordsStack(Stack):
             environment=env, log_group=sweeper_logs, retry_attempts=0,
         )
         dlq.grant_consume_messages(sweeper)
-        records.grant_read_write_data(sweeper)
-        runs.grant_write_data(sweeper)
+        runs.grant_read_write_data(sweeper)      # run copies live in experiment-runs
         scheduler.Schedule(
             self, "SweepDeadLetters", schedule_name="effect-demo-sweep-dead-letters",
             schedule=scheduler.ScheduleExpression.rate(Duration.minutes(1)),
@@ -204,8 +227,64 @@ class CustomerRecordsStack(Stack):
         CfnOutput(self, "WorkerFunction", value=worker.function_name)
         CfnOutput(self, "SweeperFunction", value=sweeper.function_name)
         CfnOutput(self, "MaxWorkers", value=str(REBOOKING_MAX_WORKERS + REROUTING_MAX_WORKERS))
+
         CfnOutput(self, "RecordsLoaded", value=load.get_att_string("Loaded"))
         CfnOutput(self, "LoadWcuConsumed", value=load.get_att_string("WcuConsumed"))
         CfnOutput(self, "LoadWcuPerSecActual", value=load.get_att_string("WcuPerSecActual"))
         CfnOutput(self, "LoadSeconds", value=load.get_att_string("Seconds"))
         CfnOutput(self, "GoldenSetHash", value=data_hash)
+
+        self.add_alarms(records, runs, rebooking, rerouting, dlq, worker, sweeper, control)
+
+    def add_alarms(self, records, runs, rebooking, rerouting, dlq, worker, sweeper, control):
+        """
+        Ten alarms (the CloudWatch free tier), each on a single metric, emailing through one SNS
+        topic (email is free up to 1,000 a month). AWS emails a confirmation link first.
+        """
+        topic = sns.Topic(self, "Alarms", topic_name="effect-demo-alarms",
+                          display_name="IROPS demo alarms")
+        topic.add_subscription(subs.EmailSubscription(ALARM_EMAIL))
+        minute, five = Duration.minutes(1), Duration.minutes(5)
+        per_min_capacity = RUNS_WCU * 60 * ALARM_CAPACITY_SHARE
+
+        def alarm(cid, metric, threshold, periods, what, op=cw.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD):
+            a = cw.Alarm(self, cid, alarm_name=f"effect-demo-{cid}", metric=metric, threshold=threshold,
+                         evaluation_periods=periods, comparison_operator=op, alarm_description=what,
+                         treat_missing_data=cw.TreatMissingData.NOT_BREACHING)
+            a.add_alarm_action(cw_actions.SnsAction(topic))
+            a.add_ok_action(cw_actions.SnsAction(topic))
+            return a
+
+        alarm("dead-letters-waiting",
+              dlq.metric_approximate_number_of_messages_visible(period=minute, statistic="Maximum"), 1, 5,
+              "Dead letters for 5 minutes: the sweeper isn't routing them to a person")
+        alarm("rebooking-stuck-messages",
+              rebooking.metric_approximate_age_of_oldest_message(period=minute, statistic="Maximum"),
+              ALARM_MESSAGE_AGE_S, 3, "A first-pass message has waited too long: workers stuck or off")
+        alarm("rerouting-stuck-messages",
+              rerouting.metric_approximate_age_of_oldest_message(period=minute, statistic="Maximum"),
+              ALARM_MESSAGE_AGE_S, 3, "A re-route message has waited too long: workers stuck or off")
+        alarm("rebooking-backlog",
+              rebooking.metric_approximate_number_of_messages_visible(period=minute, statistic="Maximum"),
+              ALARM_BACKLOG, 3, "Backlog above the producer's cap: backpressure isn't holding")
+        alarm("runs-table-write-capacity",
+              runs.metric_consumed_write_capacity_units(period=minute, statistic="Sum"), per_min_capacity, 5,
+              f"experiment-runs writes above {int(ALARM_CAPACITY_SHARE * 100)}% of {RUNS_WCU} WCU for 5 minutes")
+        alarm("runs-table-read-capacity",
+              runs.metric_consumed_read_capacity_units(period=minute, statistic="Sum"), per_min_capacity, 5,
+              f"experiment-runs reads above {int(ALARM_CAPACITY_SHARE * 100)}% of {RUNS_RCU} RCU for 5 minutes")
+        alarm("runs-table-throttled",
+              cw.Metric(namespace="AWS/DynamoDB", metric_name="WriteThrottleEvents",
+                        dimensions_map={"TableName": runs.table_name}, period=minute, statistic="Sum"),
+              1, 1, "DynamoDB itself throttled writes to experiment-runs (real, not injected)")
+        alarm("worker-throttled",
+              worker.metric_throttles(period=five, statistic="Sum"), 1, 1,
+              "Worker invocations throttled: the account's Lambda concurrency limit was hit")
+        alarm("worker-errors",
+              worker.metric_errors(period=five, statistic="Sum"), 20, 1,
+              "20+ worker invocations failed in 5 minutes (expected during heavy chaos tests)")
+        alarm("run-not-progressing",
+              cw.Metric(namespace="IropsDemo", metric_name="SecondsSinceRunProgress", period=five,
+                        statistic="Maximum"),
+              ALARM_NO_PROGRESS_S, 1, "An active run closed no record for 10 minutes: stuck records")
+        CfnOutput(self, "AlarmTopic", value=topic.topic_arn)

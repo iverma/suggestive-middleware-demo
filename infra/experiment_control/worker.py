@@ -62,8 +62,8 @@ import uuid
 
 import throttle
 from common import (
-    is_throttle,
-    LEASE_SECONDS, RECORDS_TABLE, REBOOKING_QUEUE, REROUTING_QUEUE, RUNS_TABLE, TERMINAL,
+    ACTIVE, RUN_TTL_S, cancellation, case_key, close_counters, is_throttle, meta_key, run_pk,
+    LEASE_SECONDS, REBOOKING_QUEUE, REROUTING_QUEUE, RUNS_TABLE, TERMINAL,
     VISIBILITY_SECONDS, customer_rejects, ddb, from_ddb, knobs, now, offer_sequence, outgoing, sqs, to_ddb,
 )
 
@@ -90,7 +90,6 @@ class FunctionTimedOut(BaseException):
 
 
 CONTROL_CACHE_S = 2.0
-CONTROL_KEY = {"pk": "CONTROL", "sk": "ACTIVE"}
 COUNTERS = ("fenced", "repaired", "stale", "deferred")
 
 MAX_BACKOFF_S = 300
@@ -99,7 +98,7 @@ throttle.install(sqs)
 
 # One id per execution environment (= one concurrent worker). Survives across warm invokes.
 _ENV = {"id": "env-" + uuid.uuid4().hex[:6], "started": now()}
-_control = {"t": 0.0, "v": {}}
+_control = {}                                     # run_id -> {"t": fetched at, "v": META}
 
 
 def env_id():
@@ -116,11 +115,16 @@ def crash():
     os._exit(137)
 
 
-def control(force=False):
-    if force or now() - _control["t"] > CONTROL_CACHE_S:
-        _control["v"] = from_ddb(ddb.get_item(TableName=RUNS_TABLE, Key=to_ddb(CONTROL_KEY)).get("Item"))
-        _control["t"] = now()
-    return _control["v"]
+def run_meta(run_id, force=False):
+    """A run's settings and status, from its META item, cached per run for a couple of seconds."""
+    c = _control.setdefault(run_id, {"t": 0.0, "v": {}})
+    if force or now() - c["t"] > CONTROL_CACHE_S:
+        c["v"] = from_ddb(ddb.get_item(TableName=RUNS_TABLE, Key=to_ddb(meta_key(run_id))).get("Item"))
+        c["t"] = now()
+    if len(_control) > 50:                       # warm workers see many runs; keep the cache small
+        for k in sorted(_control, key=lambda k: _control[k]["t"])[:25]:
+            _control.pop(k, None)
+    return c["v"]
 
 
 def telemetry(fn):
@@ -146,10 +150,12 @@ def bump_many(run_id, counts):
     if not counts:
         return
     names = {f"#c{i}": k for i, k in enumerate(counts)}
-    ddb.update_item(TableName=RUNS_TABLE, Key=to_ddb({"pk": f"RUN#{run_id}", "sk": "EVENTS"}),
-                    UpdateExpression="ADD " + ", ".join(f"#c{i} :v{i}" for i in range(len(counts))),
-                    ExpressionAttributeNames=names,
-                    ExpressionAttributeValues=to_ddb({f":v{i}": v for i, v in enumerate(counts.values())}))
+    ddb.update_item(TableName=RUNS_TABLE, Key=to_ddb({"pk": run_pk(run_id), "sk": "EVENTS"}),
+                    UpdateExpression=("SET #ttl = if_not_exists(#ttl, :ttl) ADD "
+                                      + ", ".join(f"#c{i} :v{i}" for i in range(len(counts)))),
+                    ExpressionAttributeNames={**names, "#ttl": "ttl"},
+                    ExpressionAttributeValues=to_ddb({**{f":v{i}": v for i, v in enumerate(counts.values())},
+                                                      ":ttl": int(now() + RUN_TTL_S)}))
 
 
 def queue_url(arn):
@@ -166,7 +172,8 @@ def send_handoff(run_id, case_id, pass_no, kn, repair=False):
     if repair:
         bodies = bodies[:1]
     for b in bodies:
-        sqs.send_message(QueueUrl=REROUTING_QUEUE, MessageBody=b)
+        # Fair queues: grouping by run stops one run's backlog from starving the others.
+        sqs.send_message(QueueUrl=REROUTING_QUEUE, MessageBody=b, MessageGroupId=run_id)
     if len(bodies) > 1:
         bump(run_id, "duplicates_sent")
 
@@ -204,7 +211,7 @@ class Crash:
     @telemetry
     def _record(self, actual):
         ddb.put_item(TableName=RUNS_TABLE, Item=to_ddb({
-            "pk": f"RUN#{self.run_id}", "sk": f"KILL#{self.case_id}#{self.pass_no}#{env_id()}",
+            "pk": f"RUN#{self.run_id}", "sk": f"KILL#{self.case_id}#{self.pass_no}#{env_id()}", "ttl": int(now() + RUN_TTL_S),
             "case_id": self.case_id, "pass": self.pass_no, "planned": self.at, "point": actual,
             "mode": self.mode, "queue": self.queue, "worker": env_id(),
             "started_at": round(self.started_at, 3),
@@ -216,7 +223,7 @@ def stall_past_timeout(crash, deadline):
     """Slow worker: hangs past the function timeout, so Lambda kills it mid-record."""
     crash.at, crash.mode = "stalled_past_timeout", "timeout"
     telemetry(ddb.put_item)(TableName=RUNS_TABLE, Item=to_ddb({
-        "pk": f"RUN#{crash.run_id}", "sk": f"KILL#{crash.case_id}#{crash.pass_no}#{env_id()}",
+        "pk": f"RUN#{crash.run_id}", "sk": f"KILL#{crash.case_id}#{crash.pass_no}#{env_id()}", "ttl": int(now() + RUN_TTL_S),
         "case_id": crash.case_id, "pass": crash.pass_no, "planned": "stalled_past_timeout",
         "point": "stalled_past_timeout", "mode": "timeout", "queue": crash.queue, "worker": env_id(),
         "started_at": round(crash.started_at, 3), "claimed_at": round(crash.claimed_at, 3),
@@ -227,7 +234,7 @@ def stall_past_timeout(crash, deadline):
     raise FunctionTimedOut(f"{crash.case_id} pass {crash.pass_no} ran past the function timeout")
 
 
-def stall_past_lease(case_id, token, claimed_at, deadline):
+def stall_past_lease(run_id, case_id, token, claimed_at, deadline):
     """
     Zombie: still alive, but stalled until its lease is gone and, if possible, until another
     worker has taken the record over (a duplicate of this message is in flight for exactly
@@ -235,7 +242,7 @@ def stall_past_lease(case_id, token, claimed_at, deadline):
     """
     time.sleep(max(0.0, min(claimed_at + LEASE_SECONDS + 0.2, deadline) - now()))
     while now() < deadline:
-        rec = from_ddb(ddb.get_item(TableName=RECORDS_TABLE, Key=to_ddb({"case_id": case_id}),
+        rec = from_ddb(ddb.get_item(TableName=RUNS_TABLE, Key=to_ddb(case_key(run_id, case_id)),
                                     ConsistentRead=True, ProjectionExpression="fencing_token, lease_owner")
                        .get("Item"))
         if int(rec.get("fencing_token", token)) != token:
@@ -247,7 +254,7 @@ def stall_past_lease(case_id, token, claimed_at, deadline):
 @telemetry
 def record_zombie(run_id, case_id, pass_no, claimed_at, woke_at, outcome, taken_over_by):
     ddb.put_item(TableName=RUNS_TABLE, Item=to_ddb({
-        "pk": f"RUN#{run_id}", "sk": f"ZOMBIE#{case_id}#{pass_no}#{env_id()}", "case_id": case_id,
+        "pk": f"RUN#{run_id}", "sk": f"ZOMBIE#{case_id}#{pass_no}#{env_id()}", "case_id": case_id, "ttl": int(now() + RUN_TTL_S),
         "pass": pass_no, "worker": env_id(), "claimed_at": round(claimed_at, 3), "woke_at": round(woke_at, 3),
         "outcome": outcome, "taken_over_by": taken_over_by}))
     print(json.dumps({"worker": env_id(), "event": "zombie", "case_id": case_id, "pass": pass_no,
@@ -265,11 +272,11 @@ def process(record, reject_percent=None, context=None):
     if body.get("poison"):
         raise PoisonMessage(f"{case_id} pass {pass_no}: unprocessable message")
 
-    ctl = control()
-    if ctl.get("run_id") != run_id:
-        ctl = control(force=True)
-    if ctl.get("run_id") != run_id or ctl.get("status") not in ("starting", "running"):
-        return True                              # message from an old, finished or aborted run
+    ctl = run_meta(run_id)
+    if ctl.get("status") not in ACTIVE:
+        ctl = run_meta(run_id, force=True)       # a brand-new run's META may not be cached yet
+    if ctl.get("status") not in ACTIVE:
+        return True                              # message from a finished, cancelled or unknown run
     reject_percent = ctl.get("reject_percent", 50) if reject_percent is None else reject_percent
     kn = knobs(ctl)
     throttle.configure(kn.get("throttle_percent", 0))                       # this run's injected 400s
@@ -277,23 +284,23 @@ def process(record, reject_percent=None, context=None):
     t = now()
     try:
         resp = ddb.update_item(
-            TableName=RECORDS_TABLE,
-            Key=to_ddb({"case_id": case_id}),
+            TableName=RUNS_TABLE,
+            Key=to_ddb(case_key(run_id, case_id)),
             UpdateExpression=("SET fencing_token = fencing_token + :one, lease_owner = :w, "
                               "lease_expires = :exp, #st = :inprog, claimed_at = :t ADD claims :one"),
-            ConditionExpression=("run_id = :run AND pass_no = :p AND "
+            ConditionExpression=("attribute_exists(pk) AND pass_no = :p AND "
                                  "(#st = :queued OR (#st = :inprog AND lease_expires < :t))"),
             ExpressionAttributeNames={"#st": "status"},
             ExpressionAttributeValues=to_ddb({
                 ":one": 1, ":w": env_id(), ":exp": round(t + LEASE_SECONDS, 3), ":inprog": "in_progress",
-                ":queued": "queued", ":t": round(t, 3), ":run": run_id, ":p": pass_no}),
+                ":queued": "queued", ":t": round(t, 3), ":p": pass_no}),
             ReturnValues="ALL_OLD",
             ReturnValuesOnConditionCheckFailure="ALL_OLD",
         )
     except ddb.exceptions.ConditionalCheckFailedException as e:
         current = from_ddb(e.response.get("Item"))
         if (current.get("status") == "in_progress" and current.get("lease_owner") == env_id()
-                and current.get("run_id") == run_id and int(current.get("pass_no", 0)) == pass_no
+                and int(current.get("pass_no", 0)) == pass_no
                 and abs(float(current.get("claimed_at", 0)) - round(t, 3)) < 0.01):
             # Our own claim: the first attempt landed but its response was lost, and the SDK's
             # retry then failed the condition we had just satisfied. Carry on as the owner.
@@ -339,7 +346,7 @@ def process(record, reject_percent=None, context=None):
     if crash.stall == "timeout":
         stall_past_timeout(crash, deadline)
     elif crash.stall == "zombie":
-        zombie_rival = stall_past_lease(case_id, token, t, deadline - ZOMBIE_MARGIN_S)
+        zombie_rival = stall_past_lease(run_id, case_id, token, t, deadline - ZOMBIE_MARGIN_S)
 
     entry = {"p": pass_no, "o": offer, "r": outcome, "w": env_id(), "f": token, "c": round(t, 3), "t": round(now(), 3)}
     if takeover:
@@ -354,17 +361,28 @@ def process(record, reject_percent=None, context=None):
         update = ("SET #st = :final, resolution = :offer, resolved_at = :t, "
                   "history = list_append(history, :h) REMOVE lease_owner, lease_expires")
         values[":final"] = "resolved" if outcome == "accept" else "human_review"
+    record_update = {"TableName": RUNS_TABLE, "Key": to_ddb(case_key(run_id, case_id)),
+                     "UpdateExpression": update,
+                     "ConditionExpression": "fencing_token = :tok AND lease_owner = :w",
+                     "ExpressionAttributeNames": {"#st": "status"},
+                     "ExpressionAttributeValues": to_ddb(values),
+                     "ReturnValuesOnConditionCheckFailure": "ALL_OLD"}
+    current = None
     try:
-        ddb.update_item(
-            TableName=RECORDS_TABLE, Key=to_ddb({"case_id": case_id}),
-            UpdateExpression=update,
-            ConditionExpression="fencing_token = :tok AND lease_owner = :w",
-            ExpressionAttributeNames={"#st": "status"},
-            ExpressionAttributeValues=to_ddb(values),
-            ReturnValuesOnConditionCheckFailure="ALL_OLD",
-        )
+        if outcome == "reject":
+            ddb.update_item(**record_update)
+        else:
+            # Closing the record and counting it toward the run's progress happen together.
+            ddb.transact_write_items(TransactItems=[
+                {"Update": record_update},
+                close_counters(run_id, pass_no, values[":final"], now())])
     except ddb.exceptions.ConditionalCheckFailedException as e:
         current = from_ddb(e.response.get("Item"))
+    except ddb.exceptions.TransactionCanceledException as e:
+        code, current = cancellation(e)
+        if code != "ConditionalCheckFailed":
+            raise                                # a conflict or throttle: the catch-all retries it
+    if current is not None:
         mine = any(int(h.get("f", -1)) == token and h.get("w") == env_id() and int(h.get("p", 0)) == pass_no
                    for h in current.get("history", []))
         if not mine:
@@ -375,7 +393,8 @@ def process(record, reject_percent=None, context=None):
                 record_zombie(run_id, case_id, pass_no, t, now(), "fenced", zombie_rival)
             return False
         # Our own commit: it landed, but the response was lost and the SDK's retry failed the
-        # condition the first attempt had already consumed. The pass is saved; carry on.
+        # condition the first attempt had already consumed. The pass is saved (and, for a close,
+        # counted: the transaction is all-or-nothing); carry on.
         bump(run_id, "own_write_recognized")
     if crash.stall == "zombie":
         # Nobody took over while it stalled: a late but uncontested commit is legitimate.

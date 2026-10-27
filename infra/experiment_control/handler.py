@@ -2,22 +2,28 @@
 Experiment control Lambda for the IROPS re-booking demo.
 
 Served publicly through a Lambda Function URL:
-  GET  /                 UI
-  GET  /results          latest run: outcomes, passes per record, oldest unpicked, workers, recent runs
-  POST /reset            stop any run, purge queues, delete every item in both tables
-  POST /load             paced load of the golden-set inputs (?wcu_per_sec=N)
-  POST /run              start a run (?reject_percent=50&kill_percent=0&slow_percent=0&dup_percent=0
-                         &poison_percent=0&throttle_percent=0)
+  GET  /                     UI
+  GET  /results[?run=<id>]   one run in detail (latest if not given), active runs, recent runs
+  POST /run                  start a run: ?kind=chaos|integration&reject_percent=50&kill_percent=0
+                             &slow_percent=0&dup_percent=0&poison_percent=0&throttle_percent=0
+  POST /cancel?run=<id>      cancel one run; every other run carries on
+  POST /load                 paced load of the golden-set inputs into customer-records-db
+  POST /reset?confirm=everything   cancel every run, empty the queues, delete all run data
 
-Workers are not launched by this function. They are the worker Lambda, invoked
-by SQS event source mappings that Lambda autoscales from queue depth. This
-function only switches those mappings on for a run and off when it ends: an
-enabled mapping long-polls its queue around the clock, which would cost SQS
-requests while idle.
+Concurrency. Several runs can be active at once (people, tabs, experiments, integration
+checks, later load tests). Each run works on its own copy of the records, in its own
+partition of experiment-runs, so runs never share a row. Admission control keeps the total
+inside one budget: MAX_ACTIVE_RUNS runs and RECORD_BUDGET records in flight.
 
-Also invoked by CloudFormation on deploy (loads the golden set), by itself
-asynchronously (second half of /run), and by EventBridge Scheduler every few
-minutes (housekeeping: finish runs nobody is watching, switch mappings off).
+Workers are the worker Lambda, invoked by SQS event source mappings that Lambda autoscales
+from queue depth; the mappings are shared by all runs. They are on while any run is active
+and off otherwise (an enabled mapping long-polls around the clock, which costs SQS requests
+while idle). Every change of the active set bumps an epoch, and reconcile_mappings re-checks
+it after switching off, so a run finishing and another starting can't race the mappings into
+the wrong state.
+
+Also invoked by CloudFormation on deploy (loads the golden set), by itself asynchronously
+(second half of /run), and by EventBridge Scheduler every 5 minutes (housekeeping).
 Mutating routes are POST-only so link previews and crawlers can't trigger them.
 """
 import json
@@ -28,11 +34,16 @@ import urllib.request
 from datetime import datetime, timezone
 from decimal import Decimal
 
+from analysis import (
+    EVENT_COUNTERS, attribute_kills, incidents, kills_by_point, normalize_kill, race_results, score,
+    worker_activity,
+)
 from common import (
-    KILL_POINTS, knobs, outgoing,
-    DLQ, ESMS, KEY, LEASE_SECONDS, NUMERIC, RECORDS_TABLE, REBOOKING_QUEUE, REROUTING_QUEUE, RUNS_TABLE,
-    TERMINAL, VISIBILITY_SECONDS, WcuPacer, consumed, ddb, dumps, from_ddb, golden, input_rows, lam, now,
-    pace_rate, scan_all, sqs, to_ddb,
+    LEGACY_RUN_FIELDS, input_columns,
+    ACTIVE, ADMISSION_KEY, DLQ, ESMS, FINISHED, INDEX_PK, KEY, LEASE_SECONDS, RECORD_BUDGET,
+    MAX_ACTIVE_RUNS, NUMERIC, RECORDS_TABLE, REBOOKING_QUEUE, REROUTING_QUEUE, RUN_KINDS, RUNS_TABLE, TERMINAL,
+    VISIBILITY_SECONDS, WcuPacer, cancellation, case_key, consumed, ddb, dumps, from_ddb, golden,
+    input_rows, knobs, lam, meta_key, now, outgoing, pace_rate, run_pk, scan_all, sqs, to_ddb, ttl_for,
 )
 
 MAX_KILL_PERCENT = 50     # every message crashing once doubles a run's work; keep runs sane
@@ -40,14 +51,13 @@ MAX_SLOW_PERCENT = 20     # each slow pass holds a worker for ~15-20s
 MAX_DUP_PERCENT = 100
 MAX_POISON_PERCENT = 10   # each poisoned record waits out 5 failed deliveries, then the sweeper
 MAX_THROTTLE_PERCENT = 30 # share of worker AWS calls answered with a 400 throttle
-START_TIMEOUT_S = 120     # a run still "starting" after this never finished its start: roll it back
-RUN_LOCK_S = 30 * 60
+START_TIMEOUT_S = 120     # a run still "starting" after this never finished its start: fail it
+RUN_MAX_S = 30 * 60       # a run still active after this has stalled: fail it, free its budget
 STALL_S = LEASE_SECONDS + VISIBILITY_SECONDS + 30
+GOLDEN_READ_PER_SEC = 4.0 # read units/s spent copying the golden set (its table has 5)
 RESET_SETTLE_S = float(os.environ.get("RESET_SETTLE_S", "4"))
 ESM_RETRY_S = float(os.environ.get("ESM_RETRY_S", "45"))
 UI_PATH = os.path.join(os.path.dirname(__file__), "ui.html")
-CONTROL_KEY = {"pk": "CONTROL", "sk": "ACTIVE"}
-ACTIVE = ("starting", "running")
 
 
 class HttpError(Exception):
@@ -89,7 +99,42 @@ def esm_states():
     return out
 
 
-# --- load --------------------------------------------------------------------
+def admission():
+    item = from_ddb(ddb.get_item(TableName=RUNS_TABLE, Key=to_ddb(ADMISSION_KEY), ConsistentRead=True).get("Item"))
+    return {"active": set(item.get("active", set())), "records": int(item.get("active_records", 0)),
+            "epoch": int(item.get("epoch", 0))}
+
+
+def reconcile_mappings():
+    """
+    Workers on if any run is active, off if none. Switching off re-reads the admission epoch
+    afterwards: if a run was admitted meanwhile (and switched them on just before our 'off'
+    landed), switch them back on. Safe to call from anywhere, any number of times.
+    """
+    adm = admission()
+    want = bool(adm["active"])
+    states = {k: v["state"] for k, v in esm_states().items()}
+    on = {"Enabled", "Enabling", "Updating"}
+    if want and not all(s in on for s in states.values()):
+        return {"wanted": "on", "set": set_esms(True)}
+    if not want and any(s not in ("Disabled", "Disabling") for s in states.values()):
+        result = set_esms(False)
+        again = admission()
+        if again["active"] or again["epoch"] != adm["epoch"]:
+            return {"wanted": "on (raced)", "set": set_esms(True)}
+        return {"wanted": "off", "set": result}
+    return {"wanted": "on" if want else "off", "set": None}
+
+
+def safe_reconcile():
+    try:
+        return reconcile_mappings()
+    except Exception as e:                          # housekeeping and the next caller retry
+        print(dumps({"reconcile": "failed", "error": f"{type(e).__name__}: {e}"[:300]}))
+        return {"error": type(e).__name__}
+
+
+# --- golden set: load into customer-records-db --------------------------------
 def build_load_update(row):
     names, values, sets, removes = {}, {}, [], []
     for i, (col, val) in enumerate(row.items()):
@@ -101,9 +146,9 @@ def build_load_update(row):
         else:
             values[f":v{i}"] = {"N": str(Decimal(val))} if col in NUMERIC else {"S": val}
             sets.append(f"#c{i} = :v{i}")
-    names["#ft"] = "fencing_token"
-    values[":zero"] = {"N": "0"}
-    sets.append("#ft = if_not_exists(#ft, :zero)")
+    for j, f in enumerate(LEGACY_RUN_FIELDS):      # runs now work on their own copies
+        names[f"#l{j}"] = f
+        removes.append(f"#l{j}")
     expr = "SET " + ", ".join(sets) + (" REMOVE " + ", ".join(removes) if removes else "")
     return {"TableName": RECORDS_TABLE, "Key": {KEY: {"S": row[KEY]}}, "UpdateExpression": expr,
             "ExpressionAttributeNames": names, "ExpressionAttributeValues": values,
@@ -111,7 +156,7 @@ def build_load_update(row):
 
 
 def load(wcu_per_sec=None):
-    """Customer fields come from the CSV; an existing fencing_token is never reset."""
+    """Upserts the customer records from the CSV. Safe while runs are active: runs work on copies."""
     rate = pace_rate(wcu_per_sec)
     pacer = WcuPacer(rate)
     n = 0
@@ -119,6 +164,7 @@ def load(wcu_per_sec=None):
         pacer.record(consumed(ddb.update_item(**build_load_update(row))))
         n += 1
     secs = pacer.elapsed()
+    _golden_count.clear()
     result = {"loaded": n, "wcu_consumed": round(pacer.used, 2), "wcu_per_sec_budget": rate,
               "wcu_per_sec_actual": round(pacer.used / secs, 2) if secs else None,
               "seconds": round(secs, 1), "table": RECORDS_TABLE}
@@ -126,36 +172,45 @@ def load(wcu_per_sec=None):
     return result
 
 
-# --- reset -------------------------------------------------------------------
-def paced_delete(table, keys, pacer):
-    for k in keys:
-        pacer.record(consumed(ddb.delete_item(TableName=table, Key=to_ddb(k), ReturnConsumedCapacity="TOTAL")))
+def read_golden():
+    """The customer records, read from customer-records-db at a paced read rate."""
+    items, start, t0, used = [], None, time.monotonic(), 0.0
+    while True:
+        kw = {"TableName": RECORDS_TABLE, "Limit": 25, "ReturnConsumedCapacity": "TOTAL"}
+        if start:
+            kw["ExclusiveStartKey"] = start
+        resp = ddb.scan(**kw)
+        items += [from_ddb(i) for i in resp.get("Items", [])]
+        used += consumed(resp)
+        ahead = used / GOLDEN_READ_PER_SEC - (time.monotonic() - t0)
+        if ahead > 0:
+            time.sleep(ahead)
+        start = resp.get("LastEvaluatedKey")
+        if not start:
+            return sorted(items, key=lambda r: r[KEY])
 
 
-def reset(wcu_per_sec=None):
-    t0 = now()
-    esm = set_esms(False)
-    ddb.put_item(TableName=RUNS_TABLE, Item=to_ddb({**CONTROL_KEY, "status": "aborted", "run_id": "",
-                                                     "expires_at": round(now() + 60, 3)}))
-    time.sleep(RESET_SETTLE_S)          # in-flight worker invokes finish or see the abort
-    purged = []
-    for q in (REBOOKING_QUEUE, REROUTING_QUEUE, DLQ):
-        try:
-            sqs.purge_queue(QueueUrl=q)
-            purged.append(q.rsplit("/", 1)[-1])
-        except sqs.exceptions.PurgeQueueInProgress:
-            purged.append(q.rsplit("/", 1)[-1] + " (purge already in progress)")
-    pacer = WcuPacer(pace_rate(wcu_per_sec))
-    rec_keys = [{KEY: i[KEY]} for i in scan_all(RECORDS_TABLE, ProjectionExpression=KEY)]
-    paced_delete(RECORDS_TABLE, rec_keys, pacer)
-    run_keys = [{"pk": i["pk"], "sk": i["sk"]} for i in scan_all(RUNS_TABLE, ProjectionExpression="pk, sk")]
-    paced_delete(RUNS_TABLE, run_keys, pacer)
-    _cache.clear()
-    return {"deleted_records": len(rec_keys), "deleted_run_items": len(run_keys), "purged_queues": purged,
-            "worker_mappings": esm, "wcu_consumed": round(pacer.used, 2), "seconds": round(now() - t0, 1)}
+_golden_count = {}
 
 
-# --- run ---------------------------------------------------------------------
+def golden_count():
+    """How many customer records exist; cached a minute (a COUNT scan still reads every item)."""
+    if _golden_count.get("t", 0) < now() - 60:
+        total, start = 0, None
+        while True:
+            kw = {"TableName": RECORDS_TABLE, "Select": "COUNT"}
+            if start:
+                kw["ExclusiveStartKey"] = start
+            resp = ddb.scan(**kw)
+            total += resp.get("Count", 0)
+            start = resp.get("LastEvaluatedKey")
+            if not start:
+                break
+        _golden_count.update(t=now(), n=total)
+    return _golden_count["n"]
+
+
+# --- run lifecycle -----------------------------------------------------------
 def _int_param(params, name, default, lo, hi):
     raw = params.get(name, default)
     try:
@@ -167,160 +222,240 @@ def _int_param(params, name, default, lo, hi):
     return v
 
 
-def acquire_lock(summary, t):
+def get_meta(run_id, consistent=False):
+    return from_ddb(ddb.get_item(TableName=RUNS_TABLE, Key=to_ddb(meta_key(run_id)),
+                                 ConsistentRead=consistent).get("Item"))
+
+
+def admit(meta, index, client_token=None):
     """
-    Take the run lock and create the run's summary in ONE transaction: either both exist or
-    neither does, so a crash here can never leave a lock with no run behind it (which would
-    block /run for the lock's lifetime). The lock is free when there is none, it expired, or
-    its run has finished.
+    Admit a run in ONE transaction: claim its share of the admission budget, create its META,
+    create its index entry (and remember the caller's idempotency token, if any). Either all
+    of it happens or none, so a crash here can never leave a budget claimed with no run behind
+    it. Returns (run_id or None, why not). A repeated client_token returns the run it started.
     """
-    lock = {**CONTROL_KEY, "run_id": summary["run_id"], "summary_sk": summary["sk"], "status": "starting",
-            "reject_percent": summary["reject_percent"], **knobs(summary), "started_at": round(t, 3),
-            "expires_at": round(t + RUN_LOCK_S, 3)}
+    n = int(meta["records"])
+    items = [
+        {"Update": {
+            "TableName": RUNS_TABLE, "Key": to_ddb(ADMISSION_KEY),
+            "UpdateExpression": "ADD active :id, active_records :n, epoch :one",
+            "ConditionExpression": ("(attribute_not_exists(active) OR size(active) < :maxruns) AND "
+                                    "(attribute_not_exists(active_records) OR active_records <= :room)"),
+            "ExpressionAttributeValues": to_ddb({":id": {meta["run_id"]}, ":n": n, ":one": 1,
+                                                 ":maxruns": MAX_ACTIVE_RUNS, ":room": RECORD_BUDGET - n})}},
+        {"Put": {"TableName": RUNS_TABLE, "Item": to_ddb(meta), "ConditionExpression": "attribute_not_exists(pk)"}},
+        {"Put": {"TableName": RUNS_TABLE, "Item": to_ddb(index), "ConditionExpression": "attribute_not_exists(pk)"}},
+    ]
+    token_key = {"pk": "TOKEN", "sk": str(client_token)[:80]} if client_token else None
+    if token_key:
+        items.append({"Put": {"TableName": RUNS_TABLE, "ConditionExpression": "attribute_not_exists(pk)",
+                              "Item": to_ddb({**token_key, "run_id": meta["run_id"], "ttl": meta["ttl"]})}})
     try:
-        ddb.transact_write_items(TransactItems=[
-            {"Put": {"TableName": RUNS_TABLE, "Item": to_ddb(lock),
-                     "ConditionExpression": "attribute_not_exists(pk) OR expires_at < :t OR NOT (#st IN (:s, :r))",
-                     "ExpressionAttributeNames": {"#st": "status"},
-                     "ExpressionAttributeValues": to_ddb({":t": round(t, 3), ":s": "starting", ":r": "running"})}},
-            {"Put": {"TableName": RUNS_TABLE, "Item": to_ddb(summary),
-                     "ConditionExpression": "attribute_not_exists(pk)"}},
-        ])
-        return True
-    except ddb.exceptions.TransactionCanceledException:
+        ddb.transact_write_items(TransactItems=items)
+        return meta["run_id"], None
+    except ddb.exceptions.TransactionCanceledException as e:
+        reasons = [r.get("Code") for r in e.response.get("CancellationReasons", [])]
+        if token_key and len(reasons) > 3 and reasons[3] == "ConditionalCheckFailed":
+            prior = from_ddb(ddb.get_item(TableName=RUNS_TABLE, Key=to_ddb(token_key), ConsistentRead=True).get("Item"))
+            return prior.get("run_id"), "duplicate"
+        if reasons and reasons[0] == "ConditionalCheckFailed":
+            adm = admission()
+            return None, (f"the shared run budget is full: {len(adm['active'])} of {MAX_ACTIVE_RUNS} runs and "
+                          f"{adm['records']} of {RECORD_BUDGET} records in flight; try again when one finishes")
+        raise
+
+
+def transition(run_id, status, expect, **extra):
+    """
+    Move a run to a new status: META (conditionally, only from `expect`) and its index entry
+    change together, and a finishing run gives its budget back in the same transaction. Returns
+    False if another caller got there first, so side effects run exactly once.
+    """
+    meta = get_meta(run_id, consistent=True)
+    if not meta:
         return False
+    names = {"#st": "status", **{f"#{k}": k for k in extra}}
+    values = {":s": status, **{f":{k}": v for k, v in extra.items()}}
+    sets = "SET #st = :s" + "".join(f", #{k} = :{k}" for k in extra)
+    expect_vals = {f":e{i}": e for i, e in enumerate(expect)}
+    items = [
+        {"Update": {"TableName": RUNS_TABLE, "Key": to_ddb(meta_key(run_id)), "UpdateExpression": sets,
+                    "ConditionExpression": "#st IN (" + ", ".join(expect_vals) + ")",
+                    "ExpressionAttributeNames": names,
+                    "ExpressionAttributeValues": to_ddb({**values, **expect_vals})}},
+        {"Update": {"TableName": RUNS_TABLE, "Key": to_ddb({"pk": INDEX_PK, "sk": meta["index_sk"]}),
+                    "UpdateExpression": sets, "ExpressionAttributeNames": names,
+                    "ExpressionAttributeValues": to_ddb(values)}},
+    ]
+    if status in FINISHED:
+        items.append({"Update": {
+            "TableName": RUNS_TABLE, "Key": to_ddb(ADMISSION_KEY),
+            "UpdateExpression": "DELETE active :id ADD active_records :minus, epoch :one",
+            "ExpressionAttributeValues": to_ddb({":id": {run_id}, ":minus": -int(meta.get("records", 0)), ":one": 1})}})
+    try:
+        ddb.transact_write_items(TransactItems=items)
+    except ddb.exceptions.TransactionCanceledException as e:
+        if cancellation(e)[0] == "ConditionalCheckFailed":
+            return False
+        raise
+    _cache.clear()
+    return True
+
+
+def finish(run_id, status, **extra):
+    """complete / failed / cancelled: exactly one caller wins, then the workers are reconciled."""
+    won = transition(run_id, status, list(ACTIVE), finished_at=round(now(), 3), **extra)
+    if won:
+        safe_reconcile()
+    return won
 
 
 def start_run(params):
+    kind = params.get("kind", "chaos")
+    if kind not in RUN_KINDS or kind == "load":
+        raise HttpError(400, "kind must be chaos or integration (load tests aren't built yet)")
     reject = _int_param(params, "reject_percent", 50, 0, 100)
     kn = {"kill_percent": _int_param(params, "kill_percent", 0, 0, MAX_KILL_PERCENT),
           "slow_percent": _int_param(params, "slow_percent", 0, 0, MAX_SLOW_PERCENT),
           "dup_percent": _int_param(params, "dup_percent", 0, 0, MAX_DUP_PERCENT),
           "poison_percent": _int_param(params, "poison_percent", 0, 0, MAX_POISON_PERCENT),
           "throttle_percent": _int_param(params, "throttle_percent", 0, 0, MAX_THROTTLE_PERCENT)}
+    records = golden_count()
+    if not records:
+        raise HttpError(409, "no customer records loaded; POST /load first")
     t = now()
     stamp = datetime.fromtimestamp(t, timezone.utc)
-    run_id = f"run-{stamp:%Y%m%d-%H%M%S}-{random.randint(0, 0xffff):04x}"
-    sk = f"{stamp.isoformat(timespec='seconds')}#{run_id}"
+    run_id = f"run-{stamp:%Y%m%d-%H%M%S}-{random.randint(0, 0xffffff):06x}"
+    index_sk = f"{stamp.isoformat(timespec='milliseconds')}#{run_id}"
     max_workers = sum(e["max"] for e in ESMS.values())
-    summary = {"pk": "RUN", "sk": sk, "run_id": run_id, "status": "starting", "started_at": round(t, 3),
-               "reject_percent": reject, **kn, "max_workers": max_workers}
-    if not acquire_lock(summary, t):
-        results(force=True)                     # completes the current run if it is done
-        if not acquire_lock(summary, now()):
-            raise HttpError(409, "a run is already in progress; wait for it to finish or POST /reset")
+    common_fields = {"run_id": run_id, "kind": kind, "status": "starting", "started_at": round(t, 3),
+                     "reject_percent": reject, **kn, "records": records, "max_workers": max_workers,
+                     "ttl": ttl_for(t)}
+    meta = {**meta_key(run_id), **common_fields, "index_sk": index_sk, "closed": 0, "resolved": 0,
+            "human_review": 0, "passes_total": 0, "closed_by_pass": {}, "last_progress_at": round(t, 3)}
+    index = {"pk": INDEX_PK, "sk": index_sk, **common_fields}
+    token = params.get("client_token")
+    admitted, why = admit(meta, index, token)
+    if why and why != "duplicate":
+        housekeeping()                          # frees budget held by runs that already ended
+        admitted, why = admit(meta, index, token)
+    if why == "duplicate":                      # a retried or double-submitted request
+        prior = get_meta(admitted, consistent=True)
+        return {"run_id": admitted, "kind": prior.get("kind"), "status": prior.get("status"), "duplicate": True,
+                "records": prior.get("records"), "reject_percent": prior.get("reject_percent"), **knobs(prior)}
+    if why:
+        raise HttpError(429, why)
     try:
         lam.invoke(FunctionName=os.environ["AWS_LAMBDA_FUNCTION_NAME"], InvocationType="Event",
-                   Payload=json.dumps({"internal": "start_run", **summary}).encode())
+                   Payload=json.dumps({"internal": "start_run", "run_id": run_id}).encode())
     except Exception as e:
-        rollback(run_id, sk, f"could not start the run: {type(e).__name__}")
+        finish(run_id, "failed", error=f"could not start the run: {type(e).__name__}")
         raise HttpError(503, "could not start the run; it was rolled back, try again")
-    _cache.clear()
-    return {"run_id": run_id, "status": "starting", "reject_percent": reject, **kn,
-            "workers": f"autoscaled by SQS, up to {max_workers}"}
-
-
-def set_run_status(run_id, sk, status, expect=None, **extra):
-    """
-    Move a run to a new status: its summary and the lock change together in one transaction.
-    With expect, only from those statuses; returns False if another caller got there first
-    (e.g. two /results calls both noticing the run is done), so side effects run only once.
-    """
-    names = {"#st": "status", **{f"#{k}": k for k in extra}}
-    values = {":s": status, **{f":{k}": v for k, v in extra.items()}}
-    summary = {"TableName": RUNS_TABLE, "Key": to_ddb({"pk": "RUN", "sk": sk}),
-               "UpdateExpression": "SET #st = :s" + "".join(f", #{k} = :{k}" for k in extra),
-               "ExpressionAttributeNames": names, "ExpressionAttributeValues": to_ddb(values)}
-    if expect:
-        summary["ConditionExpression"] = "#st IN (" + ", ".join(f":e{i}" for i in range(len(expect))) + ")"
-        summary["ExpressionAttributeValues"] = to_ddb({**values, **{f":e{i}": e for i, e in enumerate(expect)}})
-    lock = {"TableName": RUNS_TABLE, "Key": to_ddb(CONTROL_KEY), "UpdateExpression": "SET #st = :s",
-            "ConditionExpression": "run_id = :r", "ExpressionAttributeNames": {"#st": "status"},
-            "ExpressionAttributeValues": to_ddb({":s": status, ":r": run_id})}
-    try:
-        ddb.transact_write_items(TransactItems=[{"Update": summary}, {"Update": lock}])
-        return True
-    except ddb.exceptions.TransactionCanceledException as e:
-        reasons = [r.get("Code") for r in e.response.get("CancellationReasons", [])]
-        if reasons and reasons[0] == "ConditionalCheckFailed":
-            return False                        # someone else already moved this run on
-        # The lock belongs to a newer run or a reset: update just this run's summary.
-        try:
-            ddb.update_item(**summary)
-            return True
-        except ddb.exceptions.ConditionalCheckFailedException:
-            return False
-
-
-def rollback(run_id, sk, reason):
-    """A run that failed to start cleanly: mark it failed, stop the workers, drop its messages."""
-    print(dumps({"rollback": run_id, "reason": reason}))
-    if not set_run_status(run_id, sk, "failed", expect=["starting", "running"], error=reason):
-        return False
-    ctl = from_ddb(ddb.get_item(TableName=RUNS_TABLE, Key=to_ddb(CONTROL_KEY)).get("Item"))
-    if ctl.get("run_id") == run_id:             # only touch shared infra if no newer run owns it
-        set_esms(False)
-        for q in (REBOOKING_QUEUE, REROUTING_QUEUE):
-            try:
-                sqs.purge_queue(QueueUrl=q)
-            except sqs.exceptions.PurgeQueueInProgress:
-                pass
-    _cache.clear()
-    return True
+    return {"run_id": run_id, "kind": kind, "status": "starting", "reject_percent": reject, **kn,
+            "records": records, "workers": f"autoscaled by SQS, up to {max_workers}, shared by all runs"}
 
 
 def run_async(ev):
-    """Second half of /run, invoked asynchronously. Any failure rolls the run back."""
+    """Second half of /run, invoked asynchronously. Any failure fails the run (others carry on)."""
     try:
-        return _run_async(ev)
+        return _run_async(ev["run_id"])
     except Exception as e:
-        rollback(ev["run_id"], ev["sk"], f"run start failed: {type(e).__name__}: {e}"[:300])
+        finish(ev["run_id"], "failed", error=f"run start failed: {type(e).__name__}: {e}"[:300])
         return {"run_id": ev["run_id"], "status": "failed"}
 
 
-def _run_async(ev):
-    run_id, sk = ev["run_id"], ev["sk"]
-    esm = set_esms(True)                       # takes a few seconds to apply; overlaps record prep
+def _run_async(run_id):
+    meta = get_meta(run_id, consistent=True)
+    if meta.get("status") != "starting":
+        return {"run_id": run_id, "status": meta.get("status")}
+    safe_reconcile()                            # workers on early: overlaps with copying records
+    t = float(meta["started_at"])
     pacer = WcuPacer(pace_rate(os.environ.get("RUN_INIT_WCU_PER_SEC")))
-    t = now()
     cases = []
-    for row in input_rows():
+    columns = set(input_columns()) - {KEY}
+    for rec in read_golden()[: int(meta["records"])]:
+        case_id = rec[KEY]
+        item = {**{k: v for k, v in rec.items() if k in columns}, **case_key(run_id, case_id), KEY: case_id,
+                "run_id": run_id, "status": "queued", "pass_no": 1, "queued_at": round(now(), 3), "history": [],
+                "claims": 0, "fencing_token": 0, "ttl": ttl_for(t)}
         try:
-            resp = ddb.update_item(
-                TableName=RECORDS_TABLE, Key=to_ddb({KEY: row[KEY]}),
-                UpdateExpression=("SET run_id = :r, #st = :q, pass_no = :one, queued_at = :t, history = :empty, "
-                                  "claims = :zero REMOVE resolution, resolved_at, lease_owner, lease_expires, claimed_at"),
-                ConditionExpression="attribute_exists(case_id)",
-                ExpressionAttributeNames={"#st": "status"},
-                ExpressionAttributeValues=to_ddb({":r": run_id, ":q": "queued", ":one": 1, ":t": round(t, 3),
-                                                  ":empty": [], ":zero": 0}),
-                ReturnConsumedCapacity="TOTAL")
+            resp = ddb.put_item(TableName=RUNS_TABLE, Item=to_ddb(item), ReturnConsumedCapacity="TOTAL",
+                                ConditionExpression="attribute_not_exists(pk)")   # a retried start can't reset one
             pacer.record(consumed(resp))
-            cases.append(row[KEY])
         except ddb.exceptions.ConditionalCheckFailedException:
             pacer.record(1)
-    if not cases:
-        rollback(run_id, sk, "no customer records found; POST /load first")
-        return {"run_id": run_id, "status": "failed"}
+        cases.append(case_id)
+    if len(cases) != int(meta["records"]):      # the golden set shrank since admission
+        ddb.update_item(TableName=RUNS_TABLE, Key=to_ddb(meta_key(run_id)), UpdateExpression="SET records = :n",
+                        ExpressionAttributeValues=to_ddb({":n": len(cases)}))
 
     # Faults travel on the messages. Each producer stamps its own messages from the same
     # deterministic draws per (run, case, pass): here pass 1, in the worker every later pass.
-    kn = knobs(ev)
+    kn = knobs(meta)
     entries = [b for c in cases for b in outgoing(run_id, c, 1, kn)]
+    # MessageGroupId = run: the queues are standard queues used as SQS *fair queues*, so a run
+    # with a big backlog (a load test) can't starve another run's messages behind it.
     for i in range(0, len(entries), 10):
         sqs.send_message_batch(QueueUrl=REBOOKING_QUEUE, Entries=[
-            {"Id": str(j), "MessageBody": b} for j, b in enumerate(entries[i:i + 10])])
+            {"Id": str(j), "MessageBody": b, "MessageGroupId": run_id} for j, b in enumerate(entries[i:i + 10])])
     if len(entries) > len(cases):
-        ddb.update_item(TableName=RUNS_TABLE, Key=to_ddb({"pk": f"RUN#{run_id}", "sk": "EVENTS"}),
-                        UpdateExpression="ADD duplicates_sent :n",
-                        ExpressionAttributeValues=to_ddb({":n": len(entries) - len(cases)}))
+        ddb.update_item(TableName=RUNS_TABLE, Key=to_ddb({"pk": run_pk(run_id), "sk": "EVENTS"}),
+                        UpdateExpression="SET #ttl = if_not_exists(#ttl, :ttl) ADD duplicates_sent :n",
+                        ExpressionAttributeNames={"#ttl": "ttl"},
+                        ExpressionAttributeValues=to_ddb({":n": len(entries) - len(cases), ":ttl": ttl_for(t)}))
     # Only now is the run "running": if this function died while sending, the run is still
-    # "starting", and housekeeping rolls it back after START_TIMEOUT_S.
-    if not set_run_status(run_id, sk, "running", expect=["starting"], records=len(cases),
-                          queued_at=round(now(), 3), worker_mappings=esm):
-        return {"run_id": run_id, "status": "superseded"}
-    print(dumps({"run_id": run_id, "records": len(cases), "messages": len(entries), **kn, "esm": esm}))
+    # "starting", and housekeeping fails it after START_TIMEOUT_S.
+    transition(run_id, "running", ["starting"], queued_at=round(now(), 3), records=len(cases))
+    safe_reconcile()
+    print(dumps({"run_id": run_id, "records": len(cases), "messages": len(entries), **kn}))
     return {"run_id": run_id, "records": len(cases)}
+
+
+def cancel(params):
+    run_id = params.get("run")
+    if not run_id:
+        raise HttpError(400, "cancel which run? pass ?run=<run_id>")
+    meta = get_meta(run_id, consistent=True)
+    if not meta:
+        raise HttpError(404, f"no run {run_id}")
+    if meta.get("status") in FINISHED:
+        raise HttpError(409, f"run {run_id} already {meta['status']}")
+    if not finish(run_id, "cancelled", error="cancelled by a user"):
+        raise HttpError(409, f"run {run_id} finished while it was being cancelled")
+    # Its messages stay in the shared queues; workers drop them on sight (run not active).
+    return {"run_id": run_id, "status": "cancelled"}
+
+
+# --- reset everything (admin) ------------------------------------------------
+def paced_delete(table, keys, pacer):
+    for k in keys:
+        pacer.record(consumed(ddb.delete_item(TableName=table, Key=to_ddb(k), ReturnConsumedCapacity="TOTAL")))
+
+
+def reset_all(params):
+    """Cancel every run, empty the shared queues, delete all run data. The golden set stays."""
+    if params.get("confirm") != "everything":
+        raise HttpError(400, "this cancels every run for everyone; confirm with ?confirm=everything")
+    t0 = now()
+    cancelled = [r for r in admission()["active"] if finish(r, "cancelled", error="reset by a user")]
+    ddb.put_item(TableName=RUNS_TABLE, Item=to_ddb({**ADMISSION_KEY, "active_records": 0,
+                                                    "epoch": admission()["epoch"] + 1}))
+    esm = set_esms(False)
+    time.sleep(RESET_SETTLE_S)                  # in-flight worker invokes finish or see the cancel
+    purged = []
+    for q in (REBOOKING_QUEUE, REROUTING_QUEUE, DLQ):
+        try:
+            sqs.purge_queue(QueueUrl=q)
+            purged.append(q.rsplit("/", 1)[-1])
+        except sqs.exceptions.PurgeQueueInProgress:
+            purged.append(q.rsplit("/", 1)[-1] + " (purge already in progress)")
+    pacer = WcuPacer(pace_rate(params.get("wcu_per_sec") or 15))
+    keys = [{"pk": i["pk"], "sk": i["sk"]} for i in scan_all(RUNS_TABLE, ProjectionExpression="pk, sk")
+            if (i["pk"], i["sk"]) != (ADMISSION_KEY["pk"], ADMISSION_KEY["sk"])]
+    paced_delete(RUNS_TABLE, keys, pacer)
+    _cache.clear()
+    return {"cancelled_runs": cancelled, "deleted_run_items": len(keys), "purged_queues": purged,
+            "worker_mappings": esm, "wcu_consumed": round(pacer.used, 2), "seconds": round(now() - t0, 1)}
 
 
 # --- results -----------------------------------------------------------------
@@ -338,243 +473,61 @@ def queue_depths():
     return out
 
 
-def score(row, g):
-    offered = [h["o"] for h in row.get("history", [])]
-    bad = [o for o in offered if o in g["unacceptable"]]
-    ok = (row.get("status") == "resolved" and row.get("resolution") in g["acceptable"] and not bad)
-    return ok, bad
+def query_all(**kw):
+    items, start = [], None
+    while True:
+        if start:
+            kw["ExclusiveStartKey"] = start
+        resp = ddb.query(TableName=RUNS_TABLE, **kw)
+        items += [from_ddb(i) for i in resp.get("Items", [])]
+        start = resp.get("LastEvaluatedKey")
+        if not start:
+            return items
 
 
-def worker_activity(rows, kills, start, end, t):
-    """
-    Reconstruct what the autoscaled workers did from the records themselves: every pass
-    a worker handles leaves a [claim, commit] interval in the record's history, a record
-    being worked right now has a live lease, and a killed worker left a KILL item.
-    """
-    killed_envs = {k["worker"] for k in kills if k.get("worker") and k.get("mode", "exit") in ("exit", "timeout")}
-    faulted = {(k["worker"], k["case_id"], int(k.get("pass", 1))) for k in kills}   # their leases are abandoned
-    intervals = []   # (start, end, env, pool)
-    for r in rows:
-        for h in r.get("history", []):
-            if "c" in h:
-                intervals.append((float(h["c"]), float(h["t"]), h["w"], "rebooking" if int(h["p"]) == 1 else "rerouting"))
-        if (r.get("status") == "in_progress" and r.get("lease_owner") not in killed_envs
-                and (r.get("lease_owner"), r[KEY], int(r.get("pass_no", 1))) not in faulted
-                and float(r.get("lease_expires", 0)) > t):
-            pool = "rebooking" if int(r.get("pass_no", 1)) == 1 else "rerouting"
-            intervals.append((float(r.get("claimed_at", t)), t, r["lease_owner"], pool))
-    for k in kills:
-        if k.get("worker"):
-            began = float(k.get("claimed_at") or k.get("started_at") or k["killed_at"])
-            pool = "rebooking" if int(k.get("pass", 1)) == 1 else "rerouting"
-            intervals.append((began, float(k["killed_at"]), k["worker"], pool))
-    # One claim = one interval. A worker killed after committing appears in both the record's
-    # history and its kill entry; keep the longer of the two.
-    by_claim = {}
-    for a, b, env, pool in intervals:
-        key = (env, round(a, 3))
-        if key not in by_claim or b > by_claim[key][1]:
-            by_claim[key] = (a, b, env, pool)
-    intervals = list(by_claim.values())
-
-    timeline = concurrency_timeline(intervals, start, end)
-    envs = {}
-    for a, b, env, pool in intervals:
-        e = envs.setdefault(env, {"worker_id": env, "first_seen": a, "last_seen": b, "passes": 0,
-                                  "pools": set(), "takeovers": 0, "faults": 0, "killed": env in killed_envs})
-        e["first_seen"], e["last_seen"] = min(e["first_seen"], a), max(e["last_seen"], b)
-        e["pools"].add(pool)
-    for r in rows:
-        for h in r.get("history", []):
-            if h.get("w") in envs:
-                envs[h["w"]]["passes"] += 1
-                envs[h["w"]]["takeovers"] += 1 if "from" in h else 0
-    for k in kills:
-        if k.get("worker") in envs and k.get("mode") == "raise":
-            envs[k["worker"]]["faults"] += 1
-    busy_now = {r["lease_owner"] for r in rows if r.get("status") == "in_progress"
-                and r.get("lease_owner") not in killed_envs
-                and (r.get("lease_owner"), r[KEY], int(r.get("pass_no", 1))) not in faulted
-                and float(r.get("lease_expires", 0)) > t}
-    workers = []
-    for e in sorted(envs.values(), key=lambda x: x["first_seen"]):
-        state = "killed" if e["killed"] else ("busy" if e["worker_id"] in busy_now else "idle")
-        workers.append({**e, "pools": sorted(e["pools"]), "state": state,
-                        "first_seen_s": round(e["first_seen"] - start, 1), "last_seen_s": round(e["last_seen"] - start, 1)})
-    first_claim = min((a for a, *_ in intervals), default=None)
-    return {
-        "busy_now": len(busy_now), "peak": max(timeline["total"], default=0), "used": len(envs),
-        "first_claim_s": round(first_claim - start, 1) if first_claim else None,
-        "timeline": timeline, "workers": workers,
-    }
+def progress(meta):
+    keep = ("run_id", "kind", "status", "started_at", "records", "closed", "resolved", "human_review",
+            "reject_percent", "last_progress_at", "finished_at", "error") + tuple(knobs({}).keys())
+    return {k: meta.get(k) for k in keep}
 
 
-def concurrency_timeline(intervals, start, end):
-    """Per 1s bin: the most workers that were busy at the same instant, per pool and in total.
-    An exact sweep over [claim, commit] intervals, so a crashed worker and its replacement
-    are never counted as concurrent just because they fall in the same second."""
-    n_bins = max(1, int((end - start) // 1) + 1)
-    events = sorted([(a, 1, p) for a, b, _, p in intervals] + [(b, -1, p) for a, b, _, p in intervals],
-                    key=lambda e: (e[0], e[1]))          # at a tie, ends before starts
-    cur = {"rebooking": 0, "rerouting": 0}
-    out = {"bin_s": 1, "rebooking": [0] * n_bins, "rerouting": [0] * n_bins, "total": [0] * n_bins}
-    i = 0
-    for b in range(n_bins):
-        lo, hi = start + b, start + b + 1
-        peak = {k: v for k, v in cur.items()}
-        peak_total = sum(cur.values())
-        while i < len(events) and events[i][0] < hi:
-            t_, d, p = events[i]
-            cur[p] += d
-            if t_ >= lo or d > 0:
-                peak[p] = max(peak[p], cur[p])
-                peak_total = max(peak_total, sum(cur.values()))
-            i += 1
-        out["rebooking"][b], out["rerouting"][b], out["total"][b] = peak["rebooking"], peak["rerouting"], peak_total
-    return out
-
-
-RECOVERY = {
-    "on_receive": "redelivered",
-    "after_claim": "lease takeover", "during_offer": "lease takeover",
-    "during_customer_response": "lease takeover", "before_commit": "lease takeover",
-    "after_commit_before_handoff": "handoff repaired",
-    "after_handoff_before_ack": "duplicate dropped",
-    "after_final_commit_before_ack": "finished duplicate dropped",
-    "stalled_past_timeout": "lease takeover",
-}
-TIMEOUT_POINT = "stalled_past_timeout"
-
-
-LEGACY_STAGES = {"mid_work": "before_commit", "after_commit": "after_commit_before_handoff",
-                 "before_handoff": "after_commit_before_handoff"}
-
-
-def normalize_kill(k):
-    """Kill items written before the 8 kill points existed carried only a coarse stage."""
-    if "point" not in k:
-        k = {**k, "point": LEGACY_STAGES.get(k.get("stage"), "before_commit")}
-    return {"pass": 1, "mode": "exit", **k}
-
-
-def attribute_kills(kills, rows):
-    """
-    For each crash, check the record for the recovery that crash point should have caused,
-    and how long it took. Recovered = the record moved past the crashed pass (or finished)
-    and, for crashes holding a lease, the next claim of that pass shows a takeover from it.
-    """
-    out = []
-    for k in sorted(map(normalize_kill, kills), key=lambda k: float(k["killed_at"])):
-        r = rows.get(k["case_id"], {})
-        p = int(k.get("pass", 1))
-        hist = r.get("history", [])
-        moved_on = r.get("status") in TERMINAL or int(r.get("pass_no", 0)) > p
-        how = RECOVERY.get(k["point"], "?")
-        nxt = None
-        if how in ("redelivered", "lease takeover"):
-            done = [h for h in hist if int(h["p"]) == p]
-            nxt = done[0] if done else None
-            recovered = bool(nxt) and (how == "redelivered" or nxt.get("from") == k["worker"])
-            if how == "redelivered" and nxt and nxt.get("from"):
-                how = "redelivered (after a takeover)"
-        elif how == "handoff repaired":
-            later = [h for h in hist if int(h["p"]) == p + 1]
-            nxt = later[0] if later else None
-            recovered = moved_on and (bool(nxt) or r.get("status") in TERMINAL)
-        else:                                    # the work itself was done before the crash
-            recovered = moved_on
-        out.append({**k, "recovered": bool(recovered), "recovered_by": how,
-                    "recovery_s": round(float(nxt["c"]) - float(k["killed_at"]), 1) if nxt and "c" in nxt else None})
-    return out
-
-
-EVENT_COUNTERS = ("fenced", "repaired", "stale", "deferred", "duplicates_sent", "throttles_injected",
-                  "sdk_retries", "failed_throttled", "failed_poison", "failed_injected", "failed_error", "backoffs",
-                  "own_write_recognized")
-
-
-def incidents(start, rows, kills, zombies, sweeps, limit=60):
-    """Everything that went wrong and how it was handled, newest first, for the incident feed."""
-    out = []
-    for k in kills:
-        out.append({"t": float(k["killed_at"]), "kind": "crash", "worker": k["worker"], "case_id": k["case_id"],
-                    "pass": int(k.get("pass", 1)), "point": k["point"], "mode": k.get("mode"),
-                    "recovered": k.get("recovered"), "recovered_by": k.get("recovered_by")})
-    for r in rows:
-        for h in r.get("history", []):
-            if h.get("from") and "c" in h:
-                out.append({"t": float(h["c"]), "kind": "takeover", "worker": h["w"], "from": h["from"],
-                            "case_id": r[KEY], "pass": int(h["p"])})
-    for z in zombies:
-        out.append({"t": float(z["woke_at"]), "kind": "zombie", "worker": z["worker"], "case_id": z["case_id"],
-                    "pass": int(z["pass"]), "outcome": z.get("outcome"), "rival": z.get("taken_over_by")})
-    for w in sweeps:
-        out.append({"t": float(w["swept_at"]), "kind": "swept", "case_id": w["case_id"], "pass": int(w["pass"]),
-                    "deliveries": int(w.get("deliveries", 0))})
-    for e in out:
-        e["at_s"] = round(e.pop("t") - start, 1)
-    return sorted(out, key=lambda e: e["at_s"], reverse=True)[:limit]
-
-
-def race_results(run_items, rows, events):
-    """Slow-worker and duplicate-delivery outcomes, and the invariant duplicates must never break."""
-    zombies = [i for i in run_items if i["sk"].startswith("ZOMBIE#")]
-    # Exactly one committed result per (record, pass), however many copies or workers touched it.
-    double = [{"case_id": r[KEY], "passes": sorted({int(h["p"]) for h in r.get("history", [])
-                                                    if [int(x["p"]) for x in r["history"]].count(int(h["p"])) > 1})}
-              for r in rows if len({int(h["p"]) for h in r.get("history", [])}) != len(r.get("history", []))]
-    return {
-        "zombies": len(zombies),
-        "zombies_fenced": sum(1 for z in zombies if z.get("outcome") == "fenced"),
-        "zombies_uncontested": sum(1 for z in zombies if z.get("outcome") == "uncontested"),
-        "zombie_list": sorted(zombies, key=lambda z: float(z["claimed_at"])),
-        "duplicates_sent": int(events.get("duplicates_sent", 0)),
-        "duplicates_held_back": int(events.get("deferred", 0)),
-        "duplicates_dropped": int(events.get("stale", 0)),
-        "double_commits": len(double), "double_commit_list": double,
-    }
-
-
-def kills_by_point(fired):
-    rows = []
-    for point in KILL_POINTS + [TIMEOUT_POINT]:
-        ks = [k for k in fired if k["point"] == point]
-        waits = [k["recovery_s"] for k in ks if k["recovery_s"] is not None]
-        rows.append({"point": point, "fired": len(ks),
-                     "exit": sum(1 for k in ks if k.get("mode") == "exit"),
-                     "raise": sum(1 for k in ks if k.get("mode") == "raise"),
-                     "timeout": sum(1 for k in ks if k.get("mode") == "timeout"),
-                     "recovered": sum(1 for k in ks if k["recovered"]),
-                     "recovered_by": RECOVERY[point],
-                     "passes": sorted({int(k.get("pass", 1)) for k in ks}),
-                     "avg_recovery_s": round(sum(waits) / len(waits), 1) if waits else None})
-    return rows
-
-
-def results(force=False):
-    if not force and _cache.get("t", 0) > now() - CACHE_S:
-        return _cache["v"]
+def results(run_id=None, force=False):
+    key = run_id or "latest"
+    hit = _cache.get(key)
+    if not force and hit and hit["t"] > now() - CACHE_S:
+        return hit["v"]
     t = now()
-    runs = [from_ddb(i) for i in ddb.query(
+    recent = [from_ddb(i) for i in ddb.query(
         TableName=RUNS_TABLE, KeyConditionExpression="pk = :p",
-        ExpressionAttributeValues=to_ddb({":p": "RUN"}), ScanIndexForward=False, Limit=10)["Items"]]
-    records = scan_all(RECORDS_TABLE)
-    out = {"generated_at": round(t, 3), "records_in_table": len(records), "recent_runs": runs,
-           "queues": queue_depths(), "worker_mappings": esm_states(), "latest_run": None}
-    if not runs:
-        _cache.update(t=t, v=out)
-        return out
+        ExpressionAttributeValues=to_ddb({":p": INDEX_PK}), ScanIndexForward=False, Limit=12)["Items"]]
+    queues = queue_depths()
+    run_id = run_id or (recent[0]["run_id"] if recent else None)
+    detail = run_detail(run_id, queues, t) if run_id else None   # may finish the run: read budget after
+    adm = admission()
+    active_metas = [m for m in (get_meta(r) for r in sorted(adm["active"])) if m]
+    out = {"generated_at": round(t, 3), "records_in_table": golden_count(), "recent_runs": recent,
+           "active_runs": [progress(m) for m in active_metas],
+           "budget": {"runs": len(adm["active"]), "max_runs": MAX_ACTIVE_RUNS,
+                      "records": adm["records"], "max_records": RECORD_BUDGET},
+           "queues": queues, "worker_mappings": esm_states(), "latest_run": detail}
+    if detail and detail["status"] == "complete":
+        for r in out["recent_runs"]:                # the index row read above predates the finish
+            if r["run_id"] == run_id and r.get("status") in ACTIVE:
+                r["status"] = "complete"
+    _cache[key] = {"t": t, "v": out}
+    return out
 
-    run = runs[0]
-    run_id = run["run_id"]
-    started = float(run["started_at"])
-    rows = [r for r in records if r.get("run_id") == run_id]
-    run_items = [from_ddb(i) for i in ddb.query(
-        TableName=RUNS_TABLE, KeyConditionExpression="pk = :p",
-        ExpressionAttributeValues=to_ddb({":p": f"RUN#{run_id}"}))["Items"]]
-    kills = [normalize_kill(i) for i in run_items if i["sk"].startswith("KILL#")]
-    sweeps = sorted((i for i in run_items if i["sk"].startswith("SWEEP#")), key=lambda i: float(i["swept_at"]))
-    events = next((i for i in run_items if i["sk"] == "EVENTS"), {})
+
+def run_detail(run_id, queues, t):
+    items = query_all(KeyConditionExpression="pk = :p", ExpressionAttributeValues=to_ddb({":p": run_pk(run_id)}))
+    meta = next((i for i in items if i["sk"] == "META"), None)
+    if not meta:
+        return None
+    rows = [i for i in items if i["sk"].startswith("CASE#")]
+    kills = [normalize_kill(i) for i in items if i["sk"].startswith("KILL#")]
+    sweeps = sorted((i for i in items if i["sk"].startswith("SWEEP#")), key=lambda i: float(i["swept_at"]))
+    events = next((i for i in items if i["sk"] == "EVENTS"), {})
+    started = float(meta["started_at"])
     gold = golden()
 
     status_counts, passes, table = {}, {}, []
@@ -603,7 +556,6 @@ def results(force=False):
             "history": [{k: h.get(k) for k in ("p", "o", "r", "w", "c", "t", "from")} for h in hist],
             "crashes_here": sum(1 for k in kills if k["case_id"] == r[KEY]),
         })
-
     open_rows = [r for r in rows if r.get("status") not in TERMINAL]
     queued = [r for r in open_rows if r.get("status") == "queued"]
 
@@ -614,18 +566,22 @@ def results(force=False):
         return {"case_id": o[KEY], "status": o.get("status"), "pass_no": o.get("pass_no"),
                 "waiting_s": round(t - float(o.get("queued_at", t)), 1)}
 
-    complete = bool(rows) and not open_rows and len(rows) == int(run.get("records", len(rows)))
-    finished_at = max((float(r.get("resolved_at", 0)) for r in rows), default=None) if complete else None
-    if run.get("finished_at"):
-        finished_at = float(run["finished_at"])
-    live = run["status"] in ACTIVE and t - started < RUN_LOCK_S
-    end = finished_at or (t if live else last_activity)
+    # Completion comes from the exactly-once counters, not from reading every record.
+    records = int(meta.get("records", 0))
+    closed = int(meta.get("closed", 0))
+    status = meta["status"]
+    if status in ACTIVE and status != "starting" and records and closed >= records:
+        finish(run_id, "complete")
+        meta = get_meta(run_id, consistent=True)
+        status = meta["status"]
+    finished_at = float(meta["finished_at"]) if meta.get("finished_at") else None
+    end = finished_at or (t if status in ACTIVE else last_activity)
     activity = worker_activity(rows, kills, started, end, t)
     fired = attribute_kills(kills, {r[KEY]: r for r in rows})
     stats = {
-        "records": len(rows), "status_counts": status_counts,
+        "records": records, "closed": closed, "status_counts": status_counts,
         "resolved": status_counts.get("resolved", 0), "human_review": status_counts.get("human_review", 0),
-        "satisfactory": satisfactory, "open": len(open_rows),
+        "satisfactory": satisfactory, "open": len(open_rows) if rows else records - closed,
         "passes_to_close": {str(k): passes[k] for k in sorted(passes)},
         "avg_passes": round(sum(k * v for k, v in passes.items()) / max(1, sum(passes.values())), 2),
         "oldest_unpicked": oldest(queued), "oldest_unresolved": oldest(open_rows),
@@ -633,7 +589,7 @@ def results(force=False):
         "kills_fired": len(fired), "kills_recovered": sum(1 for k in fired if k["recovered"]),
         "kills_by_point": kills_by_point(fired),
         "events": {k: int(events.get(k, 0)) for k in EVENT_COUNTERS},
-        "races": race_results(run_items, rows, events),
+        "races": race_results(items, rows, events),
         "degradation": {
             "throttles_injected": int(events.get("throttles_injected", 0)),
             "sdk_retries": int(events.get("sdk_retries", 0)),
@@ -646,33 +602,30 @@ def results(force=False):
         },
         "workers_busy_now": activity["busy_now"], "workers_peak": activity["peak"],
         "workers_used": activity["used"], "first_claim_s": activity["first_claim_s"],
-        "queued_s": round(float(run["queued_at"]) - started, 1) if run.get("queued_at") else None,
+        "queued_s": round(float(meta["queued_at"]) - started, 1) if meta.get("queued_at") else None,
         "duration_s": round(end - started, 1),
     }
-    status = run["status"]
-    if status in ACTIVE and complete:
-        status = "complete"
-        won = set_run_status(run_id, run["sk"], "complete", expect=list(ACTIVE),
-                             finished_at=round(finished_at, 3), final=json.loads(dumps(stats)))
-        run.update(status="complete", finished_at=finished_at)
-        if won:                                 # exactly one caller switches the workers off
-            try:
-                set_esms(False)                 # idle mappings would keep polling SQS
-            except Exception as e:              # housekeeping retries
-                print(f"could not disable worker mappings: {e!r}")
-    elif (status == "running" and open_rows and t - last_activity > STALL_S
-          and not any(q["visible"] + q["in_flight"] for q in out["queues"].values())):
-        status = "stalled"                      # open records but nothing happening: shown, not hidden
-    out["latest_run"] = {**run, "status": status, "stats": stats, "workers": activity["workers"],
-                         "incidents": incidents(started, rows, fired, stats["races"]["zombie_list"], sweeps),
-                         "sweeps": sweeps,
-                         "timeline": activity["timeline"], "kills": fired, "records": table}
-    _cache.update(t=t, v=out)
-    return out
+    if status == "complete" and "final" not in meta:
+        # Keep the summary on the index entry so the recent-runs table doesn't re-read records.
+        ddb.update_item(TableName=RUNS_TABLE, Key=to_ddb({"pk": INDEX_PK, "sk": meta["index_sk"]}),
+                        UpdateExpression="SET #f = :f", ExpressionAttributeNames={"#f": "final"},
+                        ExpressionAttributeValues=to_ddb({":f": json.loads(dumps(stats))}))
+        ddb.update_item(TableName=RUNS_TABLE, Key=to_ddb(meta_key(run_id)),
+                        UpdateExpression="SET #f = :true", ExpressionAttributeNames={"#f": "final"},
+                        ExpressionAttributeValues=to_ddb({":true": True}))
+    shown = status
+    if (status == "running" and open_rows and t - last_activity > STALL_S
+            and not any(q["visible"] + q["in_flight"] for q in queues.values())):
+        shown = "stalled"                       # open records but nothing happening: shown, not hidden
+    meta_out = {k: v for k, v in meta.items() if k not in ("pk", "sk", "closed_by_pass")}
+    return {**meta_out, "status": shown, "stats": stats, "workers": activity["workers"],
+            "incidents": incidents(started, rows, fired, stats["races"]["zombie_list"], sweeps),
+            "sweeps": sweeps, "timeline": activity["timeline"], "kills": fired, "records": table}
 
 
+# --- housekeeping --------------------------------------------------------------
 def housekeeping():
-    """Every few minutes: finish or roll back unwatched runs; never leave mappings polling idle."""
+    """Every few minutes: finish or fail unwatched runs, free their budget, reconcile workers."""
     try:
         return _housekeeping()
     except Exception as e:                      # log loudly; the next tick tries again
@@ -681,26 +634,42 @@ def housekeeping():
 
 
 def _housekeeping():
-    ctl = from_ddb(ddb.get_item(TableName=RUNS_TABLE, Key=to_ddb(CONTROL_KEY)).get("Item"))
     t = now()
-    rolled_back = None
-    if ctl.get("status") == "starting" and t - float(ctl.get("started_at", t)) > START_TIMEOUT_S:
-        rolled_back = ctl["run_id"]
-        rollback(ctl["run_id"], ctl["summary_sk"], "run start did not finish (control function died?)")
-    elif ctl.get("status") in ACTIVE and float(ctl.get("expires_at", 0)) < t:
-        rolled_back = ctl["run_id"]
-        rollback(ctl["run_id"], ctl["summary_sk"], "run lock expired before the run finished")
-    elif ctl.get("status") in ACTIVE:
-        results(force=True)                     # completes it if every record is done
-    ctl = from_ddb(ddb.get_item(TableName=RUNS_TABLE, Key=to_ddb(CONTROL_KEY)).get("Item"))
-    active = ctl.get("status") in ACTIVE
-    states = {k: v["state"] for k, v in esm_states().items()}
-    changed = None
-    if not active and any(s not in ("Disabled", "Disabling") for s in states.values()):
-        changed = set_esms(False)
-    print(dumps({"housekeeping": True, "active_run": ctl.get("run_id") if active else None,
-                 "rolled_back": rolled_back, "mappings": states, "disabled": changed}))
-    return {"active_run": active, "rolled_back": rolled_back, "mappings": states, "disabled": changed}
+    adm = admission()
+    actions, oldest_progress = {}, 0.0
+    for run_id in sorted(adm["active"]):
+        meta = get_meta(run_id, consistent=True)
+        if not meta or meta.get("status") in FINISHED:
+            # Budget still held by a run that is gone or already over (e.g. TTL'd): release it.
+            ddb.update_item(TableName=RUNS_TABLE, Key=to_ddb(ADMISSION_KEY),
+                            UpdateExpression="DELETE active :id ADD active_records :minus, epoch :one",
+                            ExpressionAttributeValues=to_ddb({":id": {run_id}, ":one": 1,
+                                                              ":minus": -int((meta or {}).get("records", 0))}))
+            actions[run_id] = "released"
+            continue
+        started = float(meta["started_at"])
+        if meta["status"] == "starting" and t - started > START_TIMEOUT_S:
+            finish(run_id, "failed", error="run start did not finish (control function died?)")
+            actions[run_id] = "failed: start"
+        elif t - started > RUN_MAX_S:
+            finish(run_id, "failed", error="run did not finish within its time limit")
+            actions[run_id] = "failed: time limit"
+        elif int(meta.get("closed", 0)) >= int(meta.get("records", 0)) > 0 and meta["status"] == "running":
+            finish(run_id, "complete")
+            actions[run_id] = "complete"
+        else:
+            oldest_progress = max(oldest_progress, t - float(meta.get("last_progress_at", started)))
+    mappings = safe_reconcile()
+    # Custom metric for the stuck-run alarm, via CloudWatch embedded metric format (a log line,
+    # no API call): seconds since any active run last closed a record. 0 when nothing is active.
+    print(json.dumps({"_aws": {"Timestamp": int(t * 1000), "CloudWatchMetrics": [{
+        "Namespace": "IropsDemo", "Dimensions": [[]],
+        "Metrics": [{"Name": "SecondsSinceRunProgress", "Unit": "Seconds"},
+                    {"Name": "ActiveRuns", "Unit": "Count"}]}]},
+        "SecondsSinceRunProgress": round(oldest_progress, 1), "ActiveRuns": len(admission()["active"])}))
+    out = {"active_runs": sorted(admission()["active"]), "actions": actions, "mappings": mappings}
+    print(dumps({"housekeeping": out}))
+    return out
 
 
 # --- entry points ------------------------------------------------------------
@@ -722,16 +691,17 @@ def route(event):
         with open(UI_PATH) as f:
             return http_response(200, f.read(), "text/html; charset=utf-8")
     if path == "/results" and method == "GET":
-        return http_response(200, results())
-    mutating = {"/reset": lambda: reset(params.get("wcu_per_sec")),
+        return http_response(200, results(params.get("run")))
+    mutating = {"/reset": lambda: reset_all(params),
                 "/load": lambda: load(params.get("wcu_per_sec")),
-                "/run": lambda: start_run(params)}
+                "/run": lambda: start_run(params),
+                "/cancel": lambda: cancel(params)}
     if path in mutating:
         if method != "POST":
             return http_response(405, {"error": f"use POST {path}"})
         return http_response(202 if path == "/run" else 200, mutating[path]())
-    return http_response(404, {"error": "not found",
-                               "routes": ["GET /", "GET /results", "POST /reset", "POST /load", "POST /run"]})
+    return http_response(404, {"error": "not found", "routes": [
+        "GET /", "GET /results?run=", "POST /run", "POST /cancel?run=", "POST /load", "POST /reset?confirm=everything"]})
 
 
 def respond_cfn(event, context, status, data=None, reason=""):
@@ -775,9 +745,10 @@ def handler(event, context):
         except Exception as e:
             print(f"error: {e!r}")
             return http_response(500, {"error": type(e).__name__, "detail": str(e)[:300]})
-    # direct console invocation: {"action": "load" | "reset" | "results" | "run", ...}
-    actions = {"load": lambda: load(event.get("wcu_per_sec")), "reset": lambda: reset(event.get("wcu_per_sec")),
-               "results": lambda: results(force=True), "run": lambda: start_run(event)}
+    # direct console invocation: {"action": "load" | "reset" | "results" | "run" | "cancel", ...}
+    actions = {"load": lambda: load(event.get("wcu_per_sec")), "reset": lambda: reset_all(event),
+               "results": lambda: results(event.get("run"), force=True), "run": lambda: start_run(event),
+               "cancel": lambda: cancel(event), "housekeeping": housekeeping}
     if event.get("action") not in actions:
         return {"error": f"unknown action {event.get('action')!r}", "actions": sorted(actions)}
     return json.loads(dumps(actions[event["action"]]()))
