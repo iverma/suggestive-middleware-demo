@@ -53,16 +53,25 @@
           display: flex; flex-direction: column; justify-content: space-between; padding: 4px 6px;
           font-family: "Barlow Condensed", sans-serif; font-weight: 600; border: 0; text-align: left;
           transition: background-color .35s ease; }
+  .tile .top { display: flex; justify-content: space-between; align-items: baseline; gap: 4px; }
   .tile .id { font-size: .95rem; line-height: 1; }
+  .tile .ft { font-size: .8rem; line-height: 1; opacity: .9; }
   .tile .p { font-size: .8rem; opacity: .9; line-height: 1; }
   .tile.in_progress { background: var(--inflight); color: #1C2A36; }
   .tile.resolved { background: var(--resolved); }
   .tile.human_review { background: var(--human); }
   .tile.empty { background: transparent; border: 1px dashed var(--line); color: var(--muted); }
-  .tile.takeover::after { content: ""; position: absolute; top: 4px; right: 4px; width: 9px; height: 9px;
+  .tile.takeover::after { content: ""; position: absolute; bottom: 5px; right: 5px; width: 9px; height: 9px;
           border-radius: 50%; background: #fff; box-shadow: 0 0 0 2px var(--bad); }
   .tile.unsat { box-shadow: inset 0 -4px 0 var(--bad); }
   @media (prefers-reduced-motion: reduce) { .tile { transition: none; } }
+  @media (max-width: 640px) {
+    .board { gap: 3px; }
+    .tile { aspect-ratio: 1; padding: 2px; justify-content: center; align-items: center; }
+    .tile .ft, .tile .p, .ft-key { display: none; }
+    .tile .id { font-size: .75rem; }
+    .tile.takeover::after { width: 6px; height: 6px; bottom: 2px; right: 2px; }
+  }
   .legend { display: flex; flex-wrap: wrap; gap: 6px 16px; margin-top: 10px; font-size: .85rem; color: var(--muted); }
   .legend i { display: inline-block; width: 12px; height: 12px; border-radius: 2px; margin-right: 6px; vertical-align: -1px; }
 
@@ -89,7 +98,7 @@
   .chart svg { display: block; width: 100%; height: 220px; overflow: visible; }
   .chart .axis { fill: var(--muted); font-size: 12px; font-family: "Atkinson Hyperlegible", sans-serif; }
   .tip { position: absolute; pointer-events: none; background: var(--panel); border: 1px solid var(--line);
-         border-radius: 4px; padding: 6px 9px; font-size: .85rem; white-space: nowrap; transform: translate(-50%, -100%);
+         border-radius: 4px; padding: 6px 9px; font-size: .85rem; white-space: nowrap;
          box-shadow: 0 2px 6px rgba(28, 42, 54, .12); }
   .tip[hidden] { display: none; }
   .tip b { font-variant-numeric: tabular-nums; }
@@ -140,6 +149,7 @@
         <span><i style="background:var(--inflight)"></i>Being re-booked</span>
         <span><i style="background:var(--resolved)"></i>Accepted an offer</span>
         <span><i style="background:var(--human)"></i>Sent to a person</span>
+        <span class="ft-key">ft: fencing token</span>
         <span>White dot: picked up after a worker died</span>
         <span>Red underline: outcome outside the golden set</span>
       </div>
@@ -240,7 +250,7 @@ function renderBoard(run, total) {
     if (!r) return `<div class="tile empty"><span class="id">–</span></div>`;
     const cls = [r.status, r.takeovers ? "takeover" : "", (r.status === "resolved" && !r.satisfactory) ? "unsat" : ""].join(" ");
     return `<button class="tile ${cls}" data-id="${esc(r.case_id)}" title="${esc(r.case_id)}: ${esc(r.status)}, pass ${r.pass_no}, fencing token ${r.fencing_token}">
-      <span class="id">${r.case_id.slice(-3)}</span><span class="p">pass ${r.pass_no ?? "–"}, ft ${r.fencing_token ?? 0}</span></button>`;
+      <span class="top"><span class="id">${r.case_id.slice(-3)}</span><span class="ft">ft ${r.fencing_token ?? 0}</span></span><span class="p">pass ${r.pass_no ?? "–"}</span></button>`;
   }).join("");
   $("board").querySelectorAll("button.tile").forEach(b => b.onclick = () => { selected = b.dataset.id; renderDetail(); });
 }
@@ -340,8 +350,12 @@ function renderChart(run, maps) {
     tip.innerHTML = `At ${mmss(i)}: <b>${tl.total[i]}</b> busy<br>First pass <b>${tl.rebooking[i]}</b>, re-route <b>${tl.rerouting[i]}</b>` +
       (killedHere.length ? `<br>Killed ${killedHere.map(k => esc(k.worker)).join(", ")}` : "");
     tip.hidden = false;
-    tip.style.left = `${(x(i + 0.5) / W) * box.width}px`;
-    tip.style.top = `${(T / H) * box.height}px`;
+    // inside the plot, beside the crosshair; flips left past the midpoint so it never leaves the chart
+    const cx = (x(i + 0.5) / W) * box.width;
+    const right = cx < box.width / 2;
+    tip.style.left = right ? `${cx + 10}px` : "";
+    tip.style.right = right ? "" : `${box.width - cx + 10}px`;
+    tip.style.top = `${((T + 6) / H) * box.height}px`;
   };
   hit.onmousemove = (e) => show(e.clientX);
   hit.ontouchstart = (e) => show(e.touches[0].clientX);
