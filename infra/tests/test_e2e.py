@@ -813,20 +813,24 @@ def test_throttled_start_invocations_are_adopted(env):
     handler, common, *_ = env
     assert http(handler, "POST", "/load")[0] == 200
     real = handler.lam.invoke
-    first = threading.Event()
+    first, all_admitted = threading.Event(), threading.Event()
 
     def throttled(FunctionName, InvocationType, Payload):
         ev = json.loads(Payload)
-        if ev.get("internal") == "start_run" and first.is_set():
-            def later():
-                time.sleep(20)                  # Lambda retrying a throttled async invoke
-                real(FunctionName=FunctionName, InvocationType=InvocationType, Payload=Payload)
-            threading.Thread(target=later, daemon=True).start()
-            return {"StatusCode": 202}
+        if ev.get("internal") != "start_run":
+            return real(FunctionName=FunctionName, InvocationType=InvocationType, Payload=Payload)
+        delay = 20 if first.is_set() else 0     # Lambda retrying throttled async invokes; one gets through
         first.set()
-        return real(FunctionName=FunctionName, InvocationType=InvocationType, Payload=Payload)
+
+        def later():
+            all_admitted.wait(10)               # the three clients all start at once
+            time.sleep(delay)
+            real(FunctionName=FunctionName, InvocationType=InvocationType, Payload=Payload)
+        threading.Thread(target=later, daemon=True).start()
+        return {"StatusCode": 202}
     handler.lam.invoke = throttled
     ids = [start(handler, kind="integration", reject_percent=0, client_token=str(uuid.uuid4())) for _ in range(3)]
+    all_admitted.set()
     time.sleep(0.2)
     end = time.time() + 15
     while time.time() < end and any(handler.get_meta(r, consistent=True)["status"] == "starting" for r in ids):

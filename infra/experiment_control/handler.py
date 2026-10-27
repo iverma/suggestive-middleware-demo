@@ -448,16 +448,22 @@ def adopt_starting(done_run_id):
     After setting up its own run, a start invocation sets up any other run still waiting for
     its own (throttled) start invocation, so simultaneous starts don't wait on Lambda retries.
     """
-    for run_id in sorted(admission()["active"] - {done_run_id}):
-        meta = get_meta(run_id, consistent=True)
-        if meta.get("status") != "starting" or meta.get("kind") == "load":
-            continue
-        if claim_setup(run_id):
+    done = {done_run_id}
+    while True:                                 # re-scan: more runs may have been admitted meanwhile
+        adopted = False
+        for run_id in sorted(admission()["active"] - done):
+            done.add(run_id)
+            meta = get_meta(run_id, consistent=True)
+            if meta.get("status") != "starting" or meta.get("kind") == "load" or not claim_setup(run_id):
+                continue
+            adopted = True
             try:
                 setup_run(run_id, meta)
                 print(dumps({"adopted_start": run_id}))
             except Exception as e:
                 finish(run_id, "failed", error=f"run start failed: {type(e).__name__}: {e}"[:300])
+        if not adopted:
+            return
 
 
 def setup_run(run_id, meta):
