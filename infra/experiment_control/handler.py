@@ -6,7 +6,7 @@ Served publicly through a Lambda Function URL:
   GET  /results          latest run: outcomes, passes per record, oldest unpicked, workers, recent runs
   POST /reset            stop any run, purge queues, delete every item in both tables
   POST /load             paced load of the golden-set inputs (?wcu_per_sec=N)
-  POST /run              start a run (?reject_percent=50&kill_percent=0)
+  POST /run              start a run (?reject_percent=50&kill_percent=0&slow_percent=0&dup_percent=0)
 
 Workers are not launched by this function. They are the worker Lambda, invoked
 by SQS event source mappings that Lambda autoscales from queue depth. This
@@ -28,13 +28,15 @@ from datetime import datetime, timezone
 from decimal import Decimal
 
 from common import (
-    KILL_POINTS, message_body,
+    KILL_POINTS, knobs, outgoing,
     DLQ, ESMS, KEY, LEASE_SECONDS, NUMERIC, RECORDS_TABLE, REBOOKING_QUEUE, REROUTING_QUEUE, RUNS_TABLE,
     TERMINAL, VISIBILITY_SECONDS, WcuPacer, consumed, ddb, dumps, from_ddb, golden, input_rows, lam, now,
     pace_rate, scan_all, sqs, to_ddb,
 )
 
 MAX_KILL_PERCENT = 50     # every message crashing once doubles a run's work; keep runs sane
+MAX_SLOW_PERCENT = 20     # each slow pass holds a worker for ~15-20s
+MAX_DUP_PERCENT = 100
 RUN_LOCK_S = 30 * 60
 STALL_S = LEASE_SECONDS + VISIBILITY_SECONDS + 30
 RESET_SETTLE_S = float(os.environ.get("RESET_SETTLE_S", "4"))
@@ -161,11 +163,11 @@ def _int_param(params, name, default, lo, hi):
     return v
 
 
-def acquire_lock(run_id, sk, t, reject, kill_percent):
+def acquire_lock(run_id, sk, t, reject, kn):
     ddb.put_item(
         TableName=RUNS_TABLE,
         Item=to_ddb({**CONTROL_KEY, "run_id": run_id, "summary_sk": sk, "status": "starting",
-                     "reject_percent": reject, "kill_percent": kill_percent, "started_at": round(t, 3),
+                     "reject_percent": reject, **kn, "started_at": round(t, 3),
                      "expires_at": round(t + RUN_LOCK_S, 3)}),
         ConditionExpression="attribute_not_exists(pk) OR expires_at < :t OR NOT (#st IN (:s, :r))",
         ExpressionAttributeNames={"#st": "status"},
@@ -175,27 +177,29 @@ def acquire_lock(run_id, sk, t, reject, kill_percent):
 
 def start_run(params):
     reject = _int_param(params, "reject_percent", 50, 0, 100)
-    kill_pct = _int_param(params, "kill_percent", 0, 0, MAX_KILL_PERCENT)
+    kn = {"kill_percent": _int_param(params, "kill_percent", 0, 0, MAX_KILL_PERCENT),
+          "slow_percent": _int_param(params, "slow_percent", 0, 0, MAX_SLOW_PERCENT),
+          "dup_percent": _int_param(params, "dup_percent", 0, 0, MAX_DUP_PERCENT)}
     t = now()
     stamp = datetime.fromtimestamp(t, timezone.utc)
     run_id = f"run-{stamp:%Y%m%d-%H%M%S}-{random.randint(0, 0xffff):04x}"
     sk = f"{stamp.isoformat(timespec='seconds')}#{run_id}"
     try:
-        acquire_lock(run_id, sk, t, reject, kill_pct)
+        acquire_lock(run_id, sk, t, reject, kn)
     except ddb.exceptions.ConditionalCheckFailedException:
         results(force=True)                     # marks the current run complete if it is
         try:
-            acquire_lock(run_id, sk, now(), reject, kill_pct)
+            acquire_lock(run_id, sk, now(), reject, kn)
         except ddb.exceptions.ConditionalCheckFailedException:
             raise HttpError(409, "a run is already in progress; wait for it to finish or POST /reset")
     max_workers = sum(e["max"] for e in ESMS.values())
     summary = {"pk": "RUN", "sk": sk, "run_id": run_id, "status": "starting", "started_at": round(t, 3),
-               "reject_percent": reject, "kill_percent": kill_pct, "max_workers": max_workers}
+               "reject_percent": reject, **kn, "max_workers": max_workers}
     ddb.put_item(TableName=RUNS_TABLE, Item=to_ddb(summary))
     lam.invoke(FunctionName=os.environ["AWS_LAMBDA_FUNCTION_NAME"], InvocationType="Event",
                Payload=json.dumps({"internal": "start_run", **summary}).encode())
     _cache.clear()
-    return {"run_id": run_id, "status": "starting", "reject_percent": reject, "kill_percent": kill_pct,
+    return {"run_id": run_id, "status": "starting", "reject_percent": reject, **kn,
             "workers": f"autoscaled by SQS, up to {max_workers}"}
 
 
@@ -244,14 +248,18 @@ def run_async(ev):
     queued_at = round(now(), 3)
     set_run_status(run_id, sk, "running", records=len(cases), queued_at=queued_at, worker_mappings=esm)
 
-    # Crashes travel on the messages. Each producer stamps its own messages from the same
-    # deterministic draw per (run, case, pass): here pass 1, in the worker every later pass.
-    kill_pct = ev.get("kill_percent", 0)
-    for i in range(0, len(cases), 10):
+    # Faults travel on the messages. Each producer stamps its own messages from the same
+    # deterministic draws per (run, case, pass): here pass 1, in the worker every later pass.
+    kn = knobs(ev)
+    entries = [b for c in cases for b in outgoing(run_id, c, 1, kn)]
+    for i in range(0, len(entries), 10):
         sqs.send_message_batch(QueueUrl=REBOOKING_QUEUE, Entries=[
-            {"Id": str(j), "MessageBody": message_body(run_id, c, 1, kill_pct)}
-            for j, c in enumerate(cases[i:i + 10])])
-    print(dumps({"run_id": run_id, "records": len(cases), "kill_percent": kill_pct, "esm": esm}))
+            {"Id": str(j), "MessageBody": b} for j, b in enumerate(entries[i:i + 10])])
+    if len(entries) > len(cases):
+        ddb.update_item(TableName=RUNS_TABLE, Key=to_ddb({"pk": f"RUN#{run_id}", "sk": "EVENTS"}),
+                        UpdateExpression="ADD duplicates_sent :n",
+                        ExpressionAttributeValues=to_ddb({":n": len(entries) - len(cases)}))
+    print(dumps({"run_id": run_id, "records": len(cases), "messages": len(entries), **kn, "esm": esm}))
     return {"run_id": run_id, "records": len(cases)}
 
 
@@ -283,7 +291,7 @@ def worker_activity(rows, kills, start, end, t):
     a worker handles leaves a [claim, commit] interval in the record's history, a record
     being worked right now has a live lease, and a killed worker left a KILL item.
     """
-    killed_envs = {k["worker"] for k in kills if k.get("worker") and k.get("mode", "exit") == "exit"}
+    killed_envs = {k["worker"] for k in kills if k.get("worker") and k.get("mode", "exit") in ("exit", "timeout")}
     faulted = {(k["worker"], k["case_id"], int(k.get("pass", 1))) for k in kills}   # their leases are abandoned
     intervals = []   # (start, end, env, pool)
     for r in rows:
@@ -373,7 +381,9 @@ RECOVERY = {
     "after_commit_before_handoff": "handoff repaired",
     "after_handoff_before_ack": "duplicate dropped",
     "after_final_commit_before_ack": "finished duplicate dropped",
+    "stalled_past_timeout": "lease takeover",
 }
+TIMEOUT_POINT = "stalled_past_timeout"
 
 
 LEGACY_STAGES = {"mid_work": "before_commit", "after_commit": "after_commit_before_handoff",
@@ -418,14 +428,34 @@ def attribute_kills(kills, rows):
     return out
 
 
+def race_results(run_items, rows, events):
+    """Slow-worker and duplicate-delivery outcomes, and the invariant duplicates must never break."""
+    zombies = [i for i in run_items if i["sk"].startswith("ZOMBIE#")]
+    # Exactly one committed result per (record, pass), however many copies or workers touched it.
+    double = [{"case_id": r[KEY], "passes": sorted({int(h["p"]) for h in r.get("history", [])
+                                                    if [int(x["p"]) for x in r["history"]].count(int(h["p"])) > 1})}
+              for r in rows if len({int(h["p"]) for h in r.get("history", [])}) != len(r.get("history", []))]
+    return {
+        "zombies": len(zombies),
+        "zombies_fenced": sum(1 for z in zombies if z.get("outcome") == "fenced"),
+        "zombies_uncontested": sum(1 for z in zombies if z.get("outcome") == "uncontested"),
+        "zombie_list": sorted(zombies, key=lambda z: float(z["claimed_at"])),
+        "duplicates_sent": int(events.get("duplicates_sent", 0)),
+        "duplicates_held_back": int(events.get("deferred", 0)),
+        "duplicates_dropped": int(events.get("stale", 0)),
+        "double_commits": len(double), "double_commit_list": double,
+    }
+
+
 def kills_by_point(fired):
     rows = []
-    for point in KILL_POINTS:
+    for point in KILL_POINTS + [TIMEOUT_POINT]:
         ks = [k for k in fired if k["point"] == point]
         waits = [k["recovery_s"] for k in ks if k["recovery_s"] is not None]
         rows.append({"point": point, "fired": len(ks),
                      "exit": sum(1 for k in ks if k.get("mode") == "exit"),
                      "raise": sum(1 for k in ks if k.get("mode") == "raise"),
+                     "timeout": sum(1 for k in ks if k.get("mode") == "timeout"),
                      "recovered": sum(1 for k in ks if k["recovered"]),
                      "recovered_by": RECOVERY[point],
                      "passes": sorted({int(k.get("pass", 1)) for k in ks}),
@@ -512,7 +542,8 @@ def results(force=False):
         "takeovers_after_crash": takeovers,
         "kills_fired": len(fired), "kills_recovered": sum(1 for k in fired if k["recovered"]),
         "kills_by_point": kills_by_point(fired),
-        "events": {k: int(events.get(k, 0)) for k in ("fenced", "repaired", "stale", "deferred")},
+        "events": {k: int(events.get(k, 0)) for k in ("fenced", "repaired", "stale", "deferred", "duplicates_sent")},
+        "races": race_results(run_items, rows, events),
         "workers_busy_now": activity["busy_now"], "workers_peak": activity["peak"],
         "workers_used": activity["used"], "first_claim_s": activity["first_claim_s"],
         "queued_s": round(float(run["queued_at"]) - started, 1) if run.get("queued_at") else None,

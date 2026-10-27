@@ -44,7 +44,7 @@ import uuid
 
 from common import (
     LEASE_SECONDS, RECORDS_TABLE, REBOOKING_QUEUE, REROUTING_QUEUE, RUNS_TABLE, TERMINAL,
-    customer_rejects, ddb, from_ddb, message_body, now, offer_sequence, sqs, to_ddb,
+    VISIBILITY_SECONDS, customer_rejects, ddb, from_ddb, knobs, now, offer_sequence, outgoing, sqs, to_ddb,
 )
 
 WORK_MIN_S = float(os.environ.get("WORK_MIN_S", "0.6"))
@@ -52,8 +52,19 @@ WORK_MAX_S = float(os.environ.get("WORK_MAX_S", "1.8"))
 OFFER_SHARE = 0.7          # of the simulated work: rules engine / inventory; the rest is the customer
 
 
+# A zombie stops waiting for a takeover this long before its invoke would time out.
+ZOMBIE_MARGIN_S = float(os.environ.get("ZOMBIE_MARGIN_S", "1.5"))
+DEFAULT_REMAINING_S = 20.0
+
+
 class InjectedFault(Exception):
     """A planned crash in "raise" mode: escapes the handler like a failing downstream call."""
+
+
+class FunctionTimedOut(BaseException):
+    """Reached only outside Lambda (tests): in Lambda the runtime is killed at the timeout first."""
+
+
 CONTROL_CACHE_S = 2.0
 CONTROL_KEY = {"pk": "CONTROL", "sk": "ACTIVE"}
 COUNTERS = ("fenced", "repaired", "stale", "deferred")
@@ -95,9 +106,18 @@ def queue_url(arn):
     return REROUTING_QUEUE if REROUTING_QUEUE.endswith("/" + name) else REBOOKING_QUEUE
 
 
-def send_handoff(run_id, case_id, pass_no, kill_percent):
-    """Next pass goes to the re-routing queue, with that pass's own crash draw (if any)."""
-    sqs.send_message(QueueUrl=REROUTING_QUEUE, MessageBody=message_body(run_id, case_id, pass_no, kill_percent))
+def send_handoff(run_id, case_id, pass_no, kn, repair=False):
+    """
+    Next pass goes to the re-routing queue, carrying that pass's own fault draws. A planned
+    duplicate is sent as two copies; a repair re-send is itself a duplicate, so it sends one.
+    """
+    bodies = outgoing(run_id, case_id, pass_no, kn)
+    if repair:
+        bodies = bodies[:1]
+    for b in bodies:
+        sqs.send_message(QueueUrl=REROUTING_QUEUE, MessageBody=b)
+    if len(bodies) > 1:
+        bump(run_id, "duplicates_sent")
 
 
 class Crash:
@@ -110,6 +130,7 @@ class Crash:
             plan = {"at": plan, "mode": "exit"}
         self.at = plan["at"] if plan else None
         self.mode = plan.get("mode", "exit") if plan else None
+        self.stall = body.get("stall") if first else None
         self.run_id, self.case_id, self.pass_no = body["run_id"], body["case_id"], int(body["pass"])
         self.queue = (record.get("eventSourceARN") or "").rsplit(":", 1)[-1]
         self.started_at, self.claimed_at = now(), None
@@ -122,7 +143,7 @@ class Crash:
 
     def fire(self, actual):
         ddb.put_item(TableName=RUNS_TABLE, Item=to_ddb({
-            "pk": f"RUN#{self.run_id}", "sk": f"KILL#{self.case_id}#{self.pass_no}",
+            "pk": f"RUN#{self.run_id}", "sk": f"KILL#{self.case_id}#{self.pass_no}#{env_id()}",
             "case_id": self.case_id, "pass": self.pass_no, "planned": self.at, "point": actual,
             "mode": self.mode, "queue": self.queue, "worker": env_id(),
             "started_at": round(self.started_at, 3),
@@ -136,11 +157,54 @@ class Crash:
         crash()
 
 
-def process(record, reject_percent=None):
+def stall_past_timeout(crash, deadline):
+    """Slow worker: hangs past the function timeout, so Lambda kills it mid-record."""
+    crash.at, crash.mode = "stalled_past_timeout", "timeout"
+    ddb.put_item(TableName=RUNS_TABLE, Item=to_ddb({
+        "pk": f"RUN#{crash.run_id}", "sk": f"KILL#{crash.case_id}#{crash.pass_no}#{env_id()}",
+        "case_id": crash.case_id, "pass": crash.pass_no, "planned": "stalled_past_timeout",
+        "point": "stalled_past_timeout", "mode": "timeout", "queue": crash.queue, "worker": env_id(),
+        "started_at": round(crash.started_at, 3), "claimed_at": round(crash.claimed_at, 3),
+        "killed_at": round(deadline, 3)}))
+    print(json.dumps({"worker": env_id(), "event": "stall_past_timeout", "case_id": crash.case_id,
+                      "pass": crash.pass_no}))
+    time.sleep(max(0.0, deadline - now()) + 1.0)
+    raise FunctionTimedOut(f"{crash.case_id} pass {crash.pass_no} ran past the function timeout")
+
+
+def stall_past_lease(case_id, token, claimed_at, deadline):
+    """
+    Zombie: still alive, but stalled until its lease is gone and, if possible, until another
+    worker has taken the record over (a duplicate of this message is in flight for exactly
+    that). Returns who took over, or None if nobody did before this invoke had to move on.
+    """
+    time.sleep(max(0.0, min(claimed_at + LEASE_SECONDS + 0.2, deadline) - now()))
+    while now() < deadline:
+        rec = from_ddb(ddb.get_item(TableName=RECORDS_TABLE, Key=to_ddb({"case_id": case_id}),
+                                    ConsistentRead=True, ProjectionExpression="fencing_token, lease_owner")
+                       .get("Item"))
+        if int(rec.get("fencing_token", token)) != token:
+            return rec.get("lease_owner") or "another worker"
+        time.sleep(0.4)
+    return None
+
+
+def record_zombie(run_id, case_id, pass_no, claimed_at, woke_at, outcome, taken_over_by):
+    ddb.put_item(TableName=RUNS_TABLE, Item=to_ddb({
+        "pk": f"RUN#{run_id}", "sk": f"ZOMBIE#{case_id}#{pass_no}#{env_id()}", "case_id": case_id,
+        "pass": pass_no, "worker": env_id(), "claimed_at": round(claimed_at, 3), "woke_at": round(woke_at, 3),
+        "outcome": outcome, "taken_over_by": taken_over_by}))
+    print(json.dumps({"worker": env_id(), "event": "zombie", "case_id": case_id, "pass": pass_no,
+                      "outcome": outcome, "taken_over_by": taken_over_by}))
+
+
+def process(record, reject_percent=None, context=None):
     """Handle one SQS message. Returns True when the message is done (Lambda deletes it)."""
     body = json.loads(record["body"])
     run_id, case_id, pass_no = body["run_id"], body["case_id"], int(body["pass"])
     crash = Crash(record, body)
+    remaining = context.get_remaining_time_in_millis() / 1000 if context else DEFAULT_REMAINING_S
+    deadline = now() + remaining                                            # when Lambda kills this invoke
     crash.at_point("on_receive")                                            # K1
 
     ctl = control()
@@ -149,7 +213,7 @@ def process(record, reject_percent=None):
     if ctl.get("run_id") != run_id or ctl.get("status") not in ("starting", "running"):
         return True                              # message from an old, finished or aborted run
     reject_percent = ctl.get("reject_percent", 50) if reject_percent is None else reject_percent
-    kill_percent = ctl.get("kill_percent", 0)
+    kn = knobs(ctl)
 
     t = now()
     try:
@@ -168,8 +232,7 @@ def process(record, reject_percent=None):
             ReturnValuesOnConditionCheckFailure="ALL_OLD",
         )
     except ddb.exceptions.ConditionalCheckFailedException as e:
-        return handle_unclaimable(record, run_id, case_id, pass_no, from_ddb(e.response.get("Item")), t,
-                                  kill_percent)
+        return handle_unclaimable(record, run_id, case_id, pass_no, from_ddb(e.response.get("Item")), t, kn)
 
     crash.claimed_at = t
     old = from_ddb(resp["Attributes"])
@@ -194,6 +257,15 @@ def process(record, reject_percent=None):
     # A human-review pass has no customer step; a plan for K4 fires at the same place as K5.
     crash.at_point("during_customer_response", fire_as="before_commit")
     crash.at_point("before_commit")                                         # K5
+
+    # Planned slowness, right before the commit (a slow downstream call or a long pause).
+    zombie_rival = None
+    if takeover:
+        crash.stall = None          # a worker rescuing a record never plays the slow one itself
+    if crash.stall == "timeout":
+        stall_past_timeout(crash, deadline)
+    elif crash.stall == "zombie":
+        zombie_rival = stall_past_lease(case_id, token, t, deadline - ZOMBIE_MARGIN_S)
 
     entry = {"p": pass_no, "o": offer, "r": outcome, "w": env_id(), "f": token, "c": round(t, 3), "t": round(now(), 3)}
     if takeover:
@@ -220,11 +292,16 @@ def process(record, reject_percent=None):
         # Someone took the record over after our lease lapsed; our result is discarded.
         # Keep the message (don't let Lambda delete it): the new owner holds the live delivery.
         bump(run_id, "fenced")
+        if crash.stall == "zombie":
+            record_zombie(run_id, case_id, pass_no, t, now(), "fenced", zombie_rival)
         return False
+    if crash.stall == "zombie":
+        # Nobody took over while it stalled: a late but uncontested commit is legitimate.
+        record_zombie(run_id, case_id, pass_no, t, now(), "uncontested", None)
 
     if outcome == "reject":
         crash.at_point("after_commit_before_handoff")                       # K6
-        send_handoff(run_id, case_id, pass_no + 1, kill_percent)
+        send_handoff(run_id, case_id, pass_no + 1, kn)
         crash.at_point("after_handoff_before_ack")                          # K7
         # A plan for K8 (final commit) on a rejection fires at the equivalent point here.
         crash.at_point("after_final_commit_before_ack", fire_as="after_handoff_before_ack")
@@ -236,23 +313,27 @@ def process(record, reject_percent=None):
     return True
 
 
-def handle_unclaimable(record, run_id, case_id, pass_no, rec, t, kill_percent=0):
+def handle_unclaimable(record, run_id, case_id, pass_no, rec, t, kn=None):
     if not rec or rec.get("run_id") != run_id or rec.get("status") in TERMINAL:
         bump(run_id, "stale")
         return True
     if int(rec.get("pass_no", 0)) > pass_no:
-        if rec.get("status") == "queued":
-            # The previous holder committed a rejection but may have died before sending
-            # the next message. Re-send it; duplicates are harmless (claims are conditional).
-            send_handoff(run_id, case_id, int(rec["pass_no"]), kill_percent)
+        waiting = t - float(rec.get("queued_at", t))
+        if rec.get("status") == "queued" and waiting >= LEASE_SECONDS:
+            # Queued for the next pass for a while with nobody picking it up: the previous
+            # holder committed a rejection but died before sending the next message. Re-send
+            # it; a duplicate is harmless (claims are conditional).
+            send_handoff(run_id, case_id, int(rec["pass_no"]), kn or {}, repair=True)
             bump(run_id, "repaired")
         else:
+            # Just handed off (this is a duplicate copy of finished work), or already picked up.
             bump(run_id, "stale")
         return True
     if rec.get("status") == "in_progress":
         # Lease still live. Don't drop the message: if the holder is dead, this delivery is
         # how the record gets recovered. Hide it until the lease runs out, then retry.
         wait = max(1, int(float(rec.get("lease_expires", t)) - t) + 1)
+        wait = min(wait, VISIBILITY_SECONDS)
         sqs.change_message_visibility(QueueUrl=queue_url(record.get("eventSourceARN")),
                                       ReceiptHandle=record["receiptHandle"], VisibilityTimeout=min(wait, 60))
         bump(run_id, "deferred")
@@ -264,6 +345,6 @@ def handle_unclaimable(record, run_id, case_id, pass_no, rec, t, kill_percent=0)
 def handler(event, context):
     failures = []
     for record in event.get("Records", []):
-        if not process(record):
+        if not process(record, context=context):
             failures.append({"itemIdentifier": record["messageId"]})
     return {"batchItemFailures": failures}

@@ -244,12 +244,52 @@ def crash_plan(run_id, case_id, pass_no, kill_percent):
             "mode": KILL_MODES[_h("crash-mode", run_id, case_id, pass_no) % len(KILL_MODES)]}
 
 
-def message_body(run_id, case_id, pass_no, kill_percent):
+# Race faults: slow workers and duplicate deliveries.
+#   stall "zombie"  - the worker stalls past its lease while still alive, then tries to commit.
+#                     Always sent with a duplicate, so another worker can take the record over
+#                     meanwhile: the late write must be fenced off.
+#   stall "timeout" - the worker stalls past the function timeout; Lambda kills it mid-record.
+#   dup             - the message is enqueued twice (SQS standard queues deliver at least once).
+STALLS = ["zombie", "timeout"]
+
+
+def race_plan(run_id, case_id, pass_no, slow_percent=0, dup_percent=0):
+    stall = None
+    if slow_percent and (_h("stall?", run_id, case_id, pass_no) % 10000) / 100.0 < float(slow_percent):
+        stall = STALLS[_h("stall-kind", run_id, case_id, pass_no) % len(STALLS)]
+    dup = stall == "zombie" or bool(
+        dup_percent and (_h("dup?", run_id, case_id, pass_no) % 10000) / 100.0 < float(dup_percent))
+    return stall, dup
+
+
+def knobs(ctl):
+    """The fault settings of a run, as stored on its control item."""
+    return {k: ctl.get(k, 0) for k in ("kill_percent", "slow_percent", "dup_percent")}
+
+
+def outgoing(run_id, case_id, pass_no, kn):
+    """
+    The message(s) to enqueue for (run, case, pass): one body, or two identical copies when a
+    duplicate is planned. Every producer (first enqueue, handoff, repair) calls this, and every
+    draw is deterministic per (run, case, pass), so all copies agree and nothing is inherited
+    from the previous pass.
+    """
     body = {"run_id": run_id, "case_id": case_id, "pass": pass_no}
-    plan = crash_plan(run_id, case_id, pass_no, kill_percent)
+    plan = crash_plan(run_id, case_id, pass_no, kn.get("kill_percent", 0))
     if plan:
         body["crash"] = plan
-    return json.dumps(body)
+    stall, dup = race_plan(run_id, case_id, pass_no, kn.get("slow_percent", 0), kn.get("dup_percent", 0))
+    if stall:
+        body["stall"] = stall
+    if dup:
+        body["dup"] = True
+    text = json.dumps(body)
+    return [text, text] if dup else [text]
+
+
+def message_body(run_id, case_id, pass_no, kill_percent):
+    """Single-copy body with only the crash draw (kept for callers and tests that use it)."""
+    return outgoing(run_id, case_id, pass_no, {"kill_percent": kill_percent})[0]
 
 
 def customer_rejects(run_id, case_id, pass_no, reject_percent):

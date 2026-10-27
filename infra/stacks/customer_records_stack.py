@@ -31,7 +31,9 @@ PACE_WCU_PER_SEC = 12          # loads, resets and run start stay under the reco
 # Worker timing: a worker invoke handles one message in ~1-2s and can never outlive WORKER_TIMEOUT.
 # The lease must be shorter than the visibility timeout, so that when SQS redelivers a crashed
 # worker's message its lease has already expired; Lambda requires visibility >= function timeout.
-WORKER_TIMEOUT_S = 10
+# Timeout == visibility (20s) > lease (15s) leaves a 15-20s window where a worker is still alive
+# but has lost its lease: that's where a zombie can exist, and where fencing has to stop it.
+WORKER_TIMEOUT_S = 20
 LEASE_SECONDS = 15
 VISIBILITY_SECONDS = 20
 

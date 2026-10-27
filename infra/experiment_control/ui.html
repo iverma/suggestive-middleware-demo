@@ -134,6 +134,8 @@
     <form class="controls" id="controls">
       <label>Reject % <input type="number" id="reject" min="0" max="100" value="50"></label>
       <label>Crash % <input type="number" id="kill" min="0" max="50" value="0"></label>
+      <label>Slow % <input type="number" id="slow" min="0" max="20" value="0"></label>
+      <label>Duplicate % <input type="number" id="dup" min="0" max="100" value="0"></label>
       <button type="submit" class="primary" id="btn-run">Start run</button>
       <button type="button" id="btn-load">Load records</button>
       <button type="button" id="btn-reset">Reset</button>
@@ -173,6 +175,12 @@
     <h2>Crash tests</h2>
     <p class="empty-note" style="margin:-4px 0 10px">Each kill point is a step in a worker's path, in order. A crash leaves the record in a different state at each one, so each should be recovered a different way.</p>
     <div class="scroll"><table id="crash-t"></table></div>
+  </section>
+
+  <section>
+    <h2>Race tests</h2>
+    <p class="empty-note" style="margin:-4px 0 10px">Duplicate deliveries and slow workers race for the same record. The fencing token must let exactly one result per record and pass through, however many copies or workers touch it.</p>
+    <div class="scroll"><table id="race-t"></table></div>
   </section>
 
   <section class="cols">
@@ -220,7 +228,7 @@ async function call(path, label) {
     const r = await fetch(path, { method: "POST" });
     const body = await r.json();
     if (!r.ok) throw new Error(body.error || r.statusText);
-    if (path.startsWith("/run")) say(`Run ${body.run_id} started: ${body.reject_percent}% rejections, ${body.kill_percent}% of worker passes crash, workers ${body.workers}.`);
+    if (path.startsWith("/run")) say(`Run ${body.run_id} started: ${body.reject_percent}% rejections; ${body.kill_percent}% of worker passes crash, ${body.slow_percent}% run slow, ${body.dup_percent}% are delivered twice; workers ${body.workers}.`);
     else if (path === "/load") say(`Loaded ${body.loaded} records in ${body.seconds}s (${body.wcu_per_sec_actual} write units/s).`);
     else say(`Reset: deleted ${body.deleted_records} records and ${body.deleted_run_items} run items. Workers switched off.`);
   } catch (e) { say(`${label} failed: ${e.message}`, true); }
@@ -229,7 +237,8 @@ async function call(path, label) {
 
 $("controls").addEventListener("submit", (e) => {
   e.preventDefault();
-  const q = new URLSearchParams({ reject_percent: $("reject").value, kill_percent: $("kill").value });
+  const q = new URLSearchParams({ reject_percent: $("reject").value, kill_percent: $("kill").value,
+                                 slow_percent: $("slow").value, dup_percent: $("dup").value });
   call(`/run?${q}`, "Starting run");
 });
 $("btn-load").onclick = () => call("/load", "Loading records");
@@ -298,7 +307,7 @@ function renderRunbox(run, maps) {
       <dt>Lost handoffs repaired</dt><dd>${s.events.repaired}</dd>
       <dt>Late writes fenced off</dt><dd>${s.events.fenced}</dd>
     </dl>
-    <p class="empty-note" style="margin-top:10px">${esc(run.run_id)}: ${run.reject_percent}% rejections, ${run.kill_percent ?? 0}% of worker passes crash.</p>`;
+    <p class="empty-note" style="margin-top:10px">${esc(run.run_id)}: ${run.reject_percent}% rejections; ${run.kill_percent ?? 0}% crash, ${run.slow_percent ?? 0}% slow, ${run.dup_percent ?? 0}% duplicated.</p>`;
 }
 
 // --- workers-over-time chart ---------------------------------------------------
@@ -379,14 +388,30 @@ const POINT_LABEL = {
   after_commit_before_handoff: "K6 Next pass saved, handoff not sent",
   after_handoff_before_ack: "K7 Handoff sent, message not acknowledged",
   after_final_commit_before_ack: "K8 Final outcome saved, message not acknowledged",
+  stalled_past_timeout: "Slow worker: hung past the function timeout",
 };
+function renderRaces(run) {
+  const r = run && run.stats.races;
+  if (!r) { $("race-t").innerHTML = `<tr><td class="empty-note">Set Slow % or Duplicate % above 0 to race workers.</td></tr>`; return; }
+  const row = (what, n, detail) => `<tr><td>${what}</td><td class="n">${n}</td><td>${detail}</td></tr>`;
+  $("race-t").innerHTML = `<tr><th>What happened</th><th class="n">Count</th><th>What it shows</th></tr>` +
+    row("Messages delivered twice", r.duplicates_sent, "Extra copies enqueued, as a standard queue may do on its own") +
+    row("Copies held back", r.duplicates_held_back, "Arrived while another worker held the lease; hidden until the lease ran out") +
+    row("Copies dropped", r.duplicates_dropped, "Arrived after the pass was already done; acknowledged without doing it again") +
+    row("Zombie workers", r.zombies, "Stalled past their lease while still alive, then tried to save") +
+    row("Zombie writes fenced off", r.zombies_fenced, "Another worker had taken over; the late write was refused") +
+    row("Zombies that finished uncontested", r.zombies_uncontested, "Nobody took over in time; the late write was the only one, so it stands") +
+    row("All late writes fenced off", run.stats.events.fenced, "Zombies plus any worker that ran slower than its lease and lost to a duplicate") +
+    row("Records with two results for one pass", `<b>${r.double_commits}</b>`, r.double_commits ? `<span style="color:var(--bad)">Race lost: ${r.double_commit_list.map(d => esc(d.case_id)).join(", ")}</span>` : "None: every pass was saved exactly once");
+}
+
 function renderCrashes(run) {
   const rows = run ? run.stats.kills_by_point : [];
-  if (!rows || !rows.length) { $("crash-t").innerHTML = `<tr><td class="empty-note">Set Crash % above 0 to inject crashes.</td></tr>`; return; }
-  $("crash-t").innerHTML = `<tr><th>Kill point</th><th class="n">Crashed</th><th class="n">Process exit</th><th class="n">Exception</th>
+  if (!rows || !rows.length) { $("crash-t").innerHTML = `<tr><td class="empty-note">Set Crash % or Slow % above 0 to inject crashes.</td></tr>`; return; }
+  $("crash-t").innerHTML = `<tr><th>Kill point</th><th class="n">Crashed</th><th class="n">Process exit</th><th class="n">Exception</th><th class="n">Timed out</th>
       <th>On passes</th><th class="n">Recovered</th><th>Recovered by</th><th class="n">Avg time to recover</th></tr>` +
     rows.map(k => `<tr><td>${esc(POINT_LABEL[k.point] || k.point)}</td><td class="n">${k.fired}</td><td class="n">${k.exit}</td>
-      <td class="n">${k.raise}</td><td>${k.passes.join(", ") || "–"}</td>
+      <td class="n">${k.raise}</td><td class="n">${k.timeout ?? 0}</td><td>${k.passes.join(", ") || "–"}</td>
       <td class="n">${k.fired ? `${k.recovered} of ${k.fired}` : "–"}</td><td>${esc(k.recovered_by)}</td>
       <td class="n">${k.avg_recovery_s != null ? `${k.avg_recovery_s}s` : "–"}</td></tr>`).join("");
 }
@@ -420,11 +445,14 @@ function renderWorkers(run) {
 }
 
 function renderRuns(runs) {
-  $("runs-t").innerHTML = runs.length ? `<tr><th>Run</th><th>Started</th><th>State</th><th class="n">Reject %</th><th class="n">Crash %</th><th class="n">Crashes</th>
+  $("runs-t").innerHTML = runs.length ? `<tr><th>Run</th><th>Started</th><th>State</th><th class="n">Reject %</th><th class="n">Crash %</th><th class="n">Slow %</th><th class="n">Dup %</th><th class="n">Crashes</th><th class="n">Fenced</th><th class="n">Double results</th>
       <th class="n">Peak workers</th><th class="n">Accepted</th><th class="n">In golden set</th><th class="n">To a person</th><th class="n">Avg passes</th><th class="n">Took</th></tr>` +
     runs.map(r => { const f = r.final || {}; return `<tr><td>${esc(r.run_id)}</td><td>${when(r.started_at)}</td><td>${esc(r.status)}</td>
       <td class="n">${r.reject_percent}</td><td class="n">${r.kill_percent ?? "–"}</td>
-      <td class="n">${f.kills_fired != null ? `${f.kills_recovered ?? f.kills_fired}/${f.kills_fired}` : "–"}</td><td class="n">${f.workers_peak ?? "–"}</td>
+      <td class="n">${r.slow_percent ?? "–"}</td><td class="n">${r.dup_percent ?? "–"}</td>
+      <td class="n">${f.kills_fired != null ? `${f.kills_recovered ?? f.kills_fired}/${f.kills_fired}` : "–"}</td>
+      <td class="n">${f.races ? `${f.races.zombies_fenced}/${f.races.zombies}` : "–"}</td>
+      <td class="n">${f.races ? f.races.double_commits : "–"}</td><td class="n">${f.workers_peak ?? "–"}</td>
       <td class="n">${f.resolved ?? "–"}</td><td class="n">${f.satisfactory ?? "–"}</td><td class="n">${f.human_review ?? "–"}</td>
       <td class="n">${f.avg_passes ?? "–"}</td><td class="n">${f.duration_s != null ? clock(f.duration_s) : "–"}</td></tr>`; }).join("")
     : `<tr><td class="empty-note">No runs yet.</td></tr>`;
@@ -451,7 +479,7 @@ async function refresh() {
     const run = data.latest_run;
     renderBoard(run, data.records_in_table); renderRunbox(run, data.worker_mappings);
     renderChart(run, data.worker_mappings); renderPasses(run); renderQueues(data.queues, data.worker_mappings);
-    renderWorkers(run); renderCrashes(run); renderRuns(data.recent_runs || []); renderRecords(run); renderDetail(); tick();
+    renderWorkers(run); renderCrashes(run); renderRaces(run); renderRuns(data.recent_runs || []); renderRecords(run); renderDetail(); tick();
     if (!run && !busy) say(data.records_in_table ? `${data.records_in_table} records loaded. Start a run.` : "No records loaded. Load records to begin.");
   } catch (e) { say(`Couldn't read results: ${e.message}`, true); }
   const live = data && data.latest_run && ACTIVE.includes(data.latest_run.status);
