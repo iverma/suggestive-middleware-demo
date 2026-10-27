@@ -376,6 +376,17 @@ RECOVERY = {
 }
 
 
+LEGACY_STAGES = {"mid_work": "before_commit", "after_commit": "after_commit_before_handoff",
+                 "before_handoff": "after_commit_before_handoff"}
+
+
+def normalize_kill(k):
+    """Kill items written before the 8 kill points existed carried only a coarse stage."""
+    if "point" not in k:
+        k = {**k, "point": LEGACY_STAGES.get(k.get("stage"), "before_commit")}
+    return {"pass": 1, "mode": "exit", **k}
+
+
 def attribute_kills(kills, rows):
     """
     For each crash, check the record for the recovery that crash point should have caused,
@@ -383,7 +394,7 @@ def attribute_kills(kills, rows):
     and, for crashes holding a lease, the next claim of that pass shows a takeover from it.
     """
     out = []
-    for k in sorted(kills, key=lambda k: float(k["killed_at"])):
+    for k in sorted(map(normalize_kill, kills), key=lambda k: float(k["killed_at"])):
         r = rows.get(k["case_id"], {})
         p = int(k.get("pass", 1))
         hist = r.get("history", [])
@@ -443,7 +454,7 @@ def results(force=False):
     run_items = [from_ddb(i) for i in ddb.query(
         TableName=RUNS_TABLE, KeyConditionExpression="pk = :p",
         ExpressionAttributeValues=to_ddb({":p": f"RUN#{run_id}"}))["Items"]]
-    kills = [i for i in run_items if i["sk"].startswith("KILL#")]
+    kills = [normalize_kill(i) for i in run_items if i["sk"].startswith("KILL#")]
     events = next((i for i in run_items if i["sk"] == "EVENTS"), {})
     gold = golden()
 

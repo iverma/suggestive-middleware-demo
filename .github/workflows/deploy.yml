@@ -82,5 +82,7 @@ jobs:
       - name: Smoke test the public URL
         run: |
           URL=$(python3 -c "import json;print(json.load(open('outputs.json'))['effect-demo-customer-records']['DemoUrl'])")
-          curl -fsS "${URL}" | grep -q "re-booking desk"
-          curl -fsS "${URL}results" | python3 -c "import json,sys; r=json.load(sys.stdin); print(f\"::notice title=Smoke test::UI up; /results sees {r['records_in_table']} records\")"
+          curl -fsS "${URL}" | grep -q "re-booking desk" || { echo "::error::UI did not load"; exit 1; }
+          CODE=$(curl -sS -o results.json -w "%{http_code}" "${URL}results")
+          if [ "$CODE" != "200" ]; then echo "::error title=Smoke test::/results returned ${CODE}: $(head -c 400 results.json)"; exit 1; fi
+          python3 -c "import json; r=json.load(open('results.json')); print(f\"::notice title=Smoke test::UI up; /results sees {r['records_in_table']} records\")"

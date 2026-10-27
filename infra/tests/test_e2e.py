@@ -351,3 +351,19 @@ def test_zombie_write_is_fenced(env):
     events = common.from_ddb(common.ddb.get_item(TableName="experiment-runs", Key=common.to_ddb(
         {"pk": f"RUN#{run_id}", "sk": "EVENTS"}))["Item"])
     assert events["fenced"] == 1
+
+
+def test_results_tolerates_kill_items_from_older_versions(env):
+    """A run recorded before the 8 kill points existed must still render (deploy smoke test)."""
+    handler, common, *_ = env
+    http(handler, "POST", "/load")
+    t = time.time()
+    common.ddb.put_item(TableName="experiment-runs", Item=common.to_ddb(
+        {"pk": "RUN", "sk": "2026-10-27T09:00:00+00:00#run-old", "run_id": "run-old", "status": "complete",
+         "started_at": t - 100, "finished_at": t - 20, "records": 1, "reject_percent": 50, "kill_workers": 3}))
+    common.ddb.put_item(TableName="experiment-runs", Item=common.to_ddb(
+        {"pk": "RUN#run-old", "sk": "KILL#IROPS-MSP-0001", "case_id": "IROPS-MSP-0001", "status": "fired",
+         "worker": "env-old", "claimed_at": t - 90, "killed_at": t - 89, "stage": "mid_work"}))
+    status, res = http(handler, "GET", "/results")
+    assert status == 200, res
+    assert res["latest_run"]["kills"][0]["point"] == "before_commit"
