@@ -23,11 +23,15 @@ Failure handling
   re-sends the handoff (repair).
 - Rejection decisions are seeded by (run, case, pass), so a retried pass makes
   the same decision as the attempt that crashed.
-- Killed workers are an injected fault carried on the message itself: a
-  message may say "crash": "mid_work" or "after_commit". On its first delivery
-  the worker records the kill, then hard-exits its execution environment at
-  that point, holding the lease and the undeleted message. No orchestrator
-  decides who dies; the redelivered copy runs normally.
+- Crashes are an injected fault carried on the message itself:
+  "crash": {"at": <kill point>, "mode": "exit" | "raise"}. The producer of each
+  message (control for pass 1, the worker for a handoff or a repair) stamps it
+  from a deterministic draw per (run, case, pass), so a re-sent copy carries the
+  same instruction and the next pass gets its own draw; nothing is copied
+  forward. Obeyed only on a message's first delivery, so each fires once.
+  "exit" kills the execution environment (process death); "raise" throws out of
+  the handler (a failing downstream call) and the environment survives. Either
+  way the incoming message is not acknowledged. See common.KILL_POINTS.
 
 Return value uses ReportBatchItemFailures: a message listed there is NOT
 deleted, so it is retried after its visibility timeout.
@@ -40,11 +44,16 @@ import uuid
 
 from common import (
     LEASE_SECONDS, RECORDS_TABLE, REBOOKING_QUEUE, REROUTING_QUEUE, RUNS_TABLE, TERMINAL,
-    customer_rejects, ddb, from_ddb, now, offer_sequence, sqs, to_ddb,
+    customer_rejects, ddb, from_ddb, message_body, now, offer_sequence, sqs, to_ddb,
 )
 
 WORK_MIN_S = float(os.environ.get("WORK_MIN_S", "0.6"))
 WORK_MAX_S = float(os.environ.get("WORK_MAX_S", "1.8"))
+OFFER_SHARE = 0.7          # of the simulated work: rules engine / inventory; the rest is the customer
+
+
+class InjectedFault(Exception):
+    """A planned crash in "raise" mode: escapes the handler like a failing downstream call."""
 CONTROL_CACHE_S = 2.0
 CONTROL_KEY = {"pk": "CONTROL", "sk": "ACTIVE"}
 COUNTERS = ("fenced", "repaired", "stale", "deferred")
@@ -58,9 +67,9 @@ def env_id():
     return _ENV["id"]
 
 
-def simulate_work():
-    """Artificial lag standing in for inventory search and pricing calls."""
-    time.sleep(random.uniform(WORK_MIN_S, WORK_MAX_S))
+def simulate_work(share=1.0):
+    """Artificial lag: inventory search and pricing (offer), then the customer's answer."""
+    time.sleep(random.uniform(WORK_MIN_S, WORK_MAX_S) * share)
 
 
 def crash():
@@ -86,38 +95,53 @@ def queue_url(arn):
     return REROUTING_QUEUE if REROUTING_QUEUE.endswith("/" + name) else REBOOKING_QUEUE
 
 
-def send_handoff(run_id, case_id, pass_no):
-    sqs.send_message(QueueUrl=REROUTING_QUEUE, MessageBody=json.dumps(
-        {"run_id": run_id, "case_id": case_id, "pass": pass_no}))
+def send_handoff(run_id, case_id, pass_no, kill_percent):
+    """Next pass goes to the re-routing queue, with that pass's own crash draw (if any)."""
+    sqs.send_message(QueueUrl=REROUTING_QUEUE, MessageBody=message_body(run_id, case_id, pass_no, kill_percent))
 
 
-def crash_point(record, body):
-    """
-    The crash instruction travels on the message, set by whoever enqueued the work:
-      "mid_work"     - die after claiming, before committing (exercises lease takeover)
-      "after_commit" - die after committing, before the handoff / ack (exercises repair
-                       of a lost handoff, or idempotent redelivery of a finished record)
-    Obeyed only on the message's first delivery, so the redelivered copy is processed
-    normally and each planned crash fires exactly once.
-    """
-    first = int(record.get("attributes", {}).get("ApproximateReceiveCount", "1")) == 1
-    return body.get("crash") if first else None
+class Crash:
+    """The crash instruction for one delivery, and the bookkeeping to fire it at most once."""
 
+    def __init__(self, record, body):
+        first = int(record.get("attributes", {}).get("ApproximateReceiveCount", "1")) == 1
+        plan = body.get("crash") if first else None
+        if isinstance(plan, str):                      # older single-string form
+            plan = {"at": plan, "mode": "exit"}
+        self.at = plan["at"] if plan else None
+        self.mode = plan.get("mode", "exit") if plan else None
+        self.run_id, self.case_id, self.pass_no = body["run_id"], body["case_id"], int(body["pass"])
+        self.queue = (record.get("eventSourceARN") or "").rsplit(":", 1)[-1]
+        self.started_at, self.claimed_at = now(), None
 
-def die(run_id, case_id, claimed_at, stage):
-    """Record the crash for the UI (telemetry, not coordination), then kill this environment."""
-    ddb.put_item(TableName=RUNS_TABLE, Item=to_ddb({
-        "pk": f"RUN#{run_id}", "sk": f"KILL#{case_id}", "case_id": case_id, "status": "fired",
-        "worker": env_id(), "claimed_at": round(claimed_at, 3), "killed_at": round(now(), 3), "stage": stage}))
-    print(json.dumps({"worker": env_id(), "event": "killed", "case_id": case_id, "stage": stage}))
-    crash()
+    def at_point(self, point, fire_as=None):
+        """Crash here if the plan says so. fire_as records where it actually happened, for
+        plans whose point doesn't exist on this path (e.g. a handoff point on an accept)."""
+        if self.at and self.at == point:
+            self.fire(fire_as or point)
+
+    def fire(self, actual):
+        ddb.put_item(TableName=RUNS_TABLE, Item=to_ddb({
+            "pk": f"RUN#{self.run_id}", "sk": f"KILL#{self.case_id}#{self.pass_no}",
+            "case_id": self.case_id, "pass": self.pass_no, "planned": self.at, "point": actual,
+            "mode": self.mode, "queue": self.queue, "worker": env_id(),
+            "started_at": round(self.started_at, 3),
+            "claimed_at": round(self.claimed_at, 3) if self.claimed_at else None,
+            "killed_at": round(now(), 3)}))
+        print(json.dumps({"worker": env_id(), "event": "crash", "case_id": self.case_id,
+                          "pass": self.pass_no, "point": actual, "mode": self.mode}))
+        self.at = None
+        if self.mode == "raise":
+            raise InjectedFault(f"injected fault at {actual} ({self.case_id} pass {self.pass_no})")
+        crash()
 
 
 def process(record, reject_percent=None):
     """Handle one SQS message. Returns True when the message is done (Lambda deletes it)."""
     body = json.loads(record["body"])
     run_id, case_id, pass_no = body["run_id"], body["case_id"], int(body["pass"])
-    crash_at = crash_point(record, body)
+    crash = Crash(record, body)
+    crash.at_point("on_receive")                                            # K1
 
     ctl = control()
     if ctl.get("run_id") != run_id:
@@ -125,6 +149,7 @@ def process(record, reject_percent=None):
     if ctl.get("run_id") != run_id or ctl.get("status") not in ("starting", "running"):
         return True                              # message from an old, finished or aborted run
     reject_percent = ctl.get("reject_percent", 50) if reject_percent is None else reject_percent
+    kill_percent = ctl.get("kill_percent", 0)
 
     t = now()
     try:
@@ -143,24 +168,32 @@ def process(record, reject_percent=None):
             ReturnValuesOnConditionCheckFailure="ALL_OLD",
         )
     except ddb.exceptions.ConditionalCheckFailedException as e:
-        return handle_unclaimable(record, run_id, case_id, pass_no, from_ddb(e.response.get("Item")), t)
+        return handle_unclaimable(record, run_id, case_id, pass_no, from_ddb(e.response.get("Item")), t,
+                                  kill_percent)
 
+    crash.claimed_at = t
     old = from_ddb(resp["Attributes"])
     token = int(old["fencing_token"]) + 1
     takeover = old.get("status") == "in_progress"
+    crash.at_point("after_claim")                                           # K2
 
     # --- decide (pass 1: rules engine; pass 2+: walk the rules ranking) -------
-    simulate_work()
+    simulate_work(OFFER_SHARE / 2)
+    crash.at_point("during_offer")                                          # K3
+    simulate_work(OFFER_SHARE / 2)
     offers = offer_sequence(old)
     offer = offers[pass_no - 1] if pass_no <= len(offers) else "HUMAN_REVIEW"
     if offer == "HUMAN_REVIEW":
         outcome = "human_review"
-    elif customer_rejects(run_id, case_id, pass_no, reject_percent):
-        outcome = "reject"
     else:
-        outcome = "accept"
-    if crash_at == "mid_work":
-        die(run_id, case_id, t, "mid_work")
+        # The offer goes out and the customer answers (downstream in real life).
+        simulate_work((1 - OFFER_SHARE) / 2)
+        crash.at_point("during_customer_response")                          # K4
+        simulate_work((1 - OFFER_SHARE) / 2)
+        outcome = "reject" if customer_rejects(run_id, case_id, pass_no, reject_percent) else "accept"
+    # A human-review pass has no customer step; a plan for K4 fires at the same place as K5.
+    crash.at_point("during_customer_response", fire_as="before_commit")
+    crash.at_point("before_commit")                                         # K5
 
     entry = {"p": pass_no, "o": offer, "r": outcome, "w": env_id(), "f": token, "c": round(t, 3), "t": round(now(), 3)}
     if takeover:
@@ -189,14 +222,21 @@ def process(record, reject_percent=None):
         bump(run_id, "fenced")
         return False
 
-    if crash_at == "after_commit":
-        die(run_id, case_id, t, "after_commit")     # committed, but the handoff / ack never happens
     if outcome == "reject":
-        send_handoff(run_id, case_id, pass_no + 1)
+        crash.at_point("after_commit_before_handoff")                       # K6
+        send_handoff(run_id, case_id, pass_no + 1, kill_percent)
+        crash.at_point("after_handoff_before_ack")                          # K7
+        # A plan for K8 (final commit) on a rejection fires at the equivalent point here.
+        crash.at_point("after_final_commit_before_ack", fire_as="after_handoff_before_ack")
+    else:
+        crash.at_point("after_final_commit_before_ack")                     # K8
+        # Handoff plans on a final outcome (nothing to hand off) fire at the equivalent point.
+        crash.at_point("after_commit_before_handoff", fire_as="after_final_commit_before_ack")
+        crash.at_point("after_handoff_before_ack", fire_as="after_final_commit_before_ack")
     return True
 
 
-def handle_unclaimable(record, run_id, case_id, pass_no, rec, t):
+def handle_unclaimable(record, run_id, case_id, pass_no, rec, t, kill_percent=0):
     if not rec or rec.get("run_id") != run_id or rec.get("status") in TERMINAL:
         bump(run_id, "stale")
         return True
@@ -204,7 +244,7 @@ def handle_unclaimable(record, run_id, case_id, pass_no, rec, t):
         if rec.get("status") == "queued":
             # The previous holder committed a rejection but may have died before sending
             # the next message. Re-send it; duplicates are harmless (claims are conditional).
-            send_handoff(run_id, case_id, int(rec["pass_no"]))
+            send_handoff(run_id, case_id, int(rec["pass_no"]), kill_percent)
             bump(run_id, "repaired")
         else:
             bump(run_id, "stale")

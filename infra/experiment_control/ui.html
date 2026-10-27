@@ -129,11 +129,11 @@
   <header>
     <div>
       <h1>MSP re-booking desk</h1>
-      <p class="sub">Winter-storm cancellations, re-booked by workers that scale with the queue. Kill some mid-flight: every record should still end accepted or with a person, none lost.</p>
+      <p class="sub">Winter-storm cancellations, re-booked by workers that scale with the queue. Crash a share of them at any step: every record should still end accepted or with a person, none lost.</p>
     </div>
     <form class="controls" id="controls">
       <label>Reject % <input type="number" id="reject" min="0" max="100" value="50"></label>
-      <label>Kill workers <input type="number" id="kill" min="0" max="20" value="0"></label>
+      <label>Crash % <input type="number" id="kill" min="0" max="50" value="0"></label>
       <button type="submit" class="primary" id="btn-run">Start run</button>
       <button type="button" id="btn-load">Load records</button>
       <button type="button" id="btn-reset">Reset</button>
@@ -167,6 +167,12 @@
       <svg id="chart-svg" role="img" aria-label="Busy workers per second during the latest run"></svg>
       <div class="tip" id="tip" hidden></div>
     </div>
+  </section>
+
+  <section>
+    <h2>Crash tests</h2>
+    <p class="empty-note" style="margin:-4px 0 10px">Each kill point is a step in a worker's path, in order. A crash leaves the record in a different state at each one, so each should be recovered a different way.</p>
+    <div class="scroll"><table id="crash-t"></table></div>
   </section>
 
   <section class="cols">
@@ -214,7 +220,7 @@ async function call(path, label) {
     const r = await fetch(path, { method: "POST" });
     const body = await r.json();
     if (!r.ok) throw new Error(body.error || r.statusText);
-    if (path.startsWith("/run")) say(`Run ${body.run_id} started: ${body.reject_percent}% rejections, ${body.kill_workers} workers to kill, workers ${body.workers}.`);
+    if (path.startsWith("/run")) say(`Run ${body.run_id} started: ${body.reject_percent}% rejections, ${body.kill_percent}% of worker passes crash, workers ${body.workers}.`);
     else if (path === "/load") say(`Loaded ${body.loaded} records in ${body.seconds}s (${body.wcu_per_sec_actual} write units/s).`);
     else say(`Reset: deleted ${body.deleted_records} records and ${body.deleted_run_items} run items. Workers switched off.`);
   } catch (e) { say(`${label} failed: ${e.message}`, true); }
@@ -223,7 +229,7 @@ async function call(path, label) {
 
 $("controls").addEventListener("submit", (e) => {
   e.preventDefault();
-  const q = new URLSearchParams({ reject_percent: $("reject").value, kill_workers: $("kill").value });
+  const q = new URLSearchParams({ reject_percent: $("reject").value, kill_percent: $("kill").value });
   call(`/run?${q}`, "Starting run");
 });
 $("btn-load").onclick = () => call("/load", "Loading records");
@@ -261,7 +267,7 @@ function renderDetail() {
   if (!r) { $("detail").hidden = true; return; }
   $("detail").hidden = false;
   $("detail").innerHTML = `<strong>${esc(r.case_id)}</strong> to ${esc(r.destination)}, ${esc(r.cabin)}, party of ${r.party_size}, ${esc(r.urgency)}${r.travel_concerns !== "none" ? ", " + esc(r.travel_concerns) : ""}.
-    Fencing token ${r.fencing_token}, claimed ${r.claims ?? 0} times this run${r.lease_owner ? `, held by ${esc(r.lease_owner)}` : ""}${r.killed_here ? ". A worker was killed while holding this record" : ""}.
+    Fencing token ${r.fencing_token}, claimed ${r.claims ?? 0} times this run${r.lease_owner ? `, held by ${esc(r.lease_owner)}` : ""}${r.crashes_here ? `. ${r.crashes_here} injected crash${r.crashes_here > 1 ? "es" : ""} on this record` : ""}.
     <ol>${r.offers.map(o => { const [off, res] = o.split(":"); return `<li>${esc(off)}: ${esc(res)}</li>`; }).join("") || "<li>No offers yet</li>"}</ol>`;
 }
 
@@ -287,12 +293,12 @@ function renderRunbox(run, maps) {
       <dt>Average passes</dt><dd>${s.avg_passes}</dd>
       <dt>Oldest unpicked</dt><dd>${s.oldest_unpicked ? `${esc(s.oldest_unpicked.case_id)}, ${ago(s.oldest_unpicked.waiting_s)}` : "none"}</dd>
       <dt>Oldest unresolved</dt><dd>${s.oldest_unresolved ? `${esc(s.oldest_unresolved.case_id)}, ${ago(s.oldest_unresolved.waiting_s)}` : "none"}</dd>
-      <dt>Workers killed</dt><dd>${s.kills_fired} of ${s.kills_planned}</dd>
-      <dt>Recovered after a crash</dt><dd>${s.takeovers_after_crash}</dd>
+      <dt>Crashes injected</dt><dd>${s.kills_fired}, ${s.kills_recovered} recovered</dd>
+      <dt>Lease takeovers</dt><dd>${s.takeovers_after_crash}</dd>
       <dt>Lost handoffs repaired</dt><dd>${s.events.repaired}</dd>
       <dt>Late writes fenced off</dt><dd>${s.events.fenced}</dd>
     </dl>
-    <p class="empty-note" style="margin-top:10px">${esc(run.run_id)}: ${run.reject_percent}% rejections, ${run.kill_workers} workers to kill.</p>`;
+    <p class="empty-note" style="margin-top:10px">${esc(run.run_id)}: ${run.reject_percent}% rejections, ${run.kill_percent ?? 0}% of worker passes crash.</p>`;
 }
 
 // --- workers-over-time chart ---------------------------------------------------
@@ -304,7 +310,7 @@ function renderChart(run, maps) {
   const last = n ? n - 1 : 0;
   $("series-key").innerHTML = POOLS.map(([k, label, v]) =>
     `<span><i style="background:var(${v})"></i>${label} <b>${tl ? tl[k][last] : 0}</b> now, peak <b>${tl ? Math.max(0, ...tl[k]) : 0}</b></span>`).join("") +
-    `<span>Vertical line: a worker was killed</span>`;
+    `<span>Vertical line: a worker crashed</span>`;
   const W = svg.clientWidth || 800, H = 220, L = 30, R = 10, T = 12, B = 26;
   const iw = W - L - R, ih = H - T - B;
   svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
@@ -348,7 +354,7 @@ function renderChart(run, maps) {
     xh.setAttribute("x1", x(i + 0.5)); xh.setAttribute("x2", x(i + 0.5)); xh.setAttribute("visibility", "visible");
     const killedHere = (run.kills || []).filter(k => Math.floor(k.killed_at - run.started_at) === i);
     tip.innerHTML = `At ${mmss(i)}: <b>${tl.total[i]}</b> busy<br>First pass <b>${tl.rebooking[i]}</b>, re-route <b>${tl.rerouting[i]}</b>` +
-      (killedHere.length ? `<br>Killed ${killedHere.map(k => esc(k.worker)).join(", ")}` : "");
+      (killedHere.length ? `<br>Crashed: ${killedHere.map(k => `${esc(k.worker)} at ${esc(POINT_LABEL[k.point] || k.point)}`).join(", ")}` : "");
     tip.hidden = false;
     // inside the plot, beside the crosshair; flips left past the midpoint so it never leaves the chart
     const cx = (x(i + 0.5) / W) * box.width;
@@ -364,6 +370,27 @@ function renderChart(run, maps) {
 window.addEventListener("resize", () => data && renderChart(data.latest_run, data.worker_mappings));
 
 // --- tables --------------------------------------------------------------------
+const POINT_LABEL = {
+  on_receive: "K1 Message received, nothing touched",
+  after_claim: "K2 Lease taken",
+  during_offer: "K3 Rules engine running",
+  during_customer_response: "K4 Waiting on the customer",
+  before_commit: "K5 Answer known, not saved",
+  after_commit_before_handoff: "K6 Next pass saved, handoff not sent",
+  after_handoff_before_ack: "K7 Handoff sent, message not acknowledged",
+  after_final_commit_before_ack: "K8 Final outcome saved, message not acknowledged",
+};
+function renderCrashes(run) {
+  const rows = run ? run.stats.kills_by_point : [];
+  if (!rows || !rows.length) { $("crash-t").innerHTML = `<tr><td class="empty-note">Set Crash % above 0 to inject crashes.</td></tr>`; return; }
+  $("crash-t").innerHTML = `<tr><th>Kill point</th><th class="n">Crashed</th><th class="n">Process exit</th><th class="n">Exception</th>
+      <th>On passes</th><th class="n">Recovered</th><th>Recovered by</th><th class="n">Avg time to recover</th></tr>` +
+    rows.map(k => `<tr><td>${esc(POINT_LABEL[k.point] || k.point)}</td><td class="n">${k.fired}</td><td class="n">${k.exit}</td>
+      <td class="n">${k.raise}</td><td>${k.passes.join(", ") || "–"}</td>
+      <td class="n">${k.fired ? `${k.recovered} of ${k.fired}` : "–"}</td><td>${esc(k.recovered_by)}</td>
+      <td class="n">${k.avg_recovery_s != null ? `${k.avg_recovery_s}s` : "–"}</td></tr>`).join("");
+}
+
 function renderPasses(run) {
   const p = run ? run.stats.passes_to_close : {};
   const max = Math.max(1, ...Object.values(p));
@@ -385,18 +412,19 @@ function renderQueues(q, maps) {
 
 function renderWorkers(run) {
   const ws = run ? run.workers : [];
-  $("workers-t").innerHTML = ws.length ? `<tr><th>Worker</th><th>State</th><th>Queues</th><th class="n">Passes handled</th><th class="n">Took over</th><th class="n">First seen</th><th class="n">Last seen</th></tr>` +
+  $("workers-t").innerHTML = ws.length ? `<tr><th>Worker</th><th>State</th><th>Queues</th><th class="n">Passes handled</th><th class="n">Took over</th><th class="n">Exceptions</th><th class="n">First seen</th><th class="n">Last seen</th></tr>` +
     ws.map(w => `<tr><td>${esc(w.worker_id)}</td><td class="ws ${esc(w.state)}">${esc(w.state)}</td>
       <td>${w.pools.map(p => p === "rebooking" ? "first pass" : "re-route").join(", ")}</td>
-      <td class="n">${w.passes}</td><td class="n">${w.takeovers}</td><td class="n">${mmss(w.first_seen_s)}</td><td class="n">${mmss(w.last_seen_s)}</td></tr>`).join("")
+      <td class="n">${w.passes}</td><td class="n">${w.takeovers}</td><td class="n">${w.faults}</td><td class="n">${mmss(w.first_seen_s)}</td><td class="n">${mmss(w.last_seen_s)}</td></tr>`).join("")
     : `<tr><td class="empty-note">Workers appear when the queue scales them up.</td></tr>`;
 }
 
 function renderRuns(runs) {
-  $("runs-t").innerHTML = runs.length ? `<tr><th>Run</th><th>Started</th><th>State</th><th class="n">Reject %</th><th class="n">Killed</th>
+  $("runs-t").innerHTML = runs.length ? `<tr><th>Run</th><th>Started</th><th>State</th><th class="n">Reject %</th><th class="n">Crash %</th><th class="n">Crashes</th>
       <th class="n">Peak workers</th><th class="n">Accepted</th><th class="n">In golden set</th><th class="n">To a person</th><th class="n">Avg passes</th><th class="n">Took</th></tr>` +
     runs.map(r => { const f = r.final || {}; return `<tr><td>${esc(r.run_id)}</td><td>${when(r.started_at)}</td><td>${esc(r.status)}</td>
-      <td class="n">${r.reject_percent}</td><td class="n">${f.kills_fired ?? r.kill_workers}</td><td class="n">${f.workers_peak ?? "–"}</td>
+      <td class="n">${r.reject_percent}</td><td class="n">${r.kill_percent ?? "–"}</td>
+      <td class="n">${f.kills_fired != null ? `${f.kills_recovered ?? f.kills_fired}/${f.kills_fired}` : "–"}</td><td class="n">${f.workers_peak ?? "–"}</td>
       <td class="n">${f.resolved ?? "–"}</td><td class="n">${f.satisfactory ?? "–"}</td><td class="n">${f.human_review ?? "–"}</td>
       <td class="n">${f.avg_passes ?? "–"}</td><td class="n">${f.duration_s != null ? clock(f.duration_s) : "–"}</td></tr>`; }).join("")
     : `<tr><td class="empty-note">No runs yet.</td></tr>`;
@@ -423,7 +451,7 @@ async function refresh() {
     const run = data.latest_run;
     renderBoard(run, data.records_in_table); renderRunbox(run, data.worker_mappings);
     renderChart(run, data.worker_mappings); renderPasses(run); renderQueues(data.queues, data.worker_mappings);
-    renderWorkers(run); renderRuns(data.recent_runs || []); renderRecords(run); renderDetail(); tick();
+    renderWorkers(run); renderCrashes(run); renderRuns(data.recent_runs || []); renderRecords(run); renderDetail(); tick();
     if (!run && !busy) say(data.records_in_table ? `${data.records_in_table} records loaded. Start a run.` : "No records loaded. Load records to begin.");
   } catch (e) { say(`Couldn't read results: ${e.message}`, true); }
   const live = data && data.latest_run && ACTIVE.includes(data.latest_run.status);

@@ -59,7 +59,8 @@ class FakeEsm:
         self.worker, self.sqs, self.queues = worker, sqs, queues      # name -> (url, arn, max)
         self.enabled = {name: False for name in queues}
         self.stop = threading.Event()
-        self.kills = 0
+        self.kills = 0          # process exits: the environment dies and is replaced
+        self.faults = 0         # exceptions out of the handler: the environment survives
         self.envs = threading.local()
         self.threads = [threading.Thread(target=self.poll, args=(name,), daemon=True)
                         for name, (_, _, mx) in queues.items() for _ in range(mx)]
@@ -86,6 +87,9 @@ class FakeEsm:
                     self.kills += 1
                     self.envs.id = "env-" + uuid.uuid4().hex[:6]       # crashed env is replaced
                     continue                                           # message stays, reappears later
+                except Exception:
+                    self.faults += 1                                   # failed invoke: message stays
+                    continue
                 if not out["batchItemFailures"]:
                     self.sqs.delete_message(QueueUrl=url, ReceiptHandle=m["ReceiptHandle"])
 
@@ -180,7 +184,7 @@ def test_ui_and_routes(env):
     assert http(handler, "GET", "/reset")[0] == 405          # mutating routes are POST-only
     assert http(handler, "GET", "/nope")[0] == 404
     assert http(handler, "POST", "/run", reject_percent=101)[0] == 400
-    assert http(handler, "POST", "/run", kill_workers=21)[0] == 400
+    assert http(handler, "POST", "/run", kill_percent=51)[0] == 400
 
 
 def test_run_without_records_fails_cleanly(env):
@@ -199,7 +203,7 @@ def test_autoscaled_run_with_killed_workers_loses_nothing(env):
     assert status == 200 and body["loaded"] == 100
     assert not any(esm.enabled.values())                      # idle: no polling
 
-    status, body = http(handler, "POST", "/run", reject_percent=50, kill_workers=4)
+    status, body = http(handler, "POST", "/run", reject_percent=50, kill_percent=15)
     assert status == 202, body
     assert http(handler, "POST", "/run")[0] == 409            # one run at a time
 
@@ -211,16 +215,14 @@ def test_autoscaled_run_with_killed_workers_loses_nothing(env):
     assert s["resolved"] + s["human_review"] == 100            # nothing lost
     assert s["satisfactory"] == s["resolved"]                  # rules pass never leaves the golden set
     assert not any(r["unacceptable_offered"] for r in run["records"])
-    assert s["kills_planned"] == 4 and s["kills_fired"] == 4 and esm.kills == 4
-    assert sum(1 for w in run["workers"] if w["state"] == "killed") == 4
-    # every crash was recovered: mid-work by a lease takeover; after-commit by handoff repair
-    # (a rejection) or by dropping the redelivered copy of an already-finished record
-    stages = [k["stage"] for k in run["kills"]]
-    assert s["takeovers_after_crash"] >= stages.count("mid_work")
-    assert s["events"]["repaired"] + s["events"]["stale"] >= stages.count("after_commit")
+    # crashes on every pass, both modes, each one recovered the way its kill point predicts
+    assert s["kills_fired"] >= 10 and s["kills_fired"] == esm.kills + esm.faults
+    assert s["kills_recovered"] == s["kills_fired"], [k for k in run["kills"] if not k["recovered"]]
+    assert any(int(k["pass"]) > 1 for k in run["kills"])
+    assert sum(1 for w in run["workers"] if w["state"] == "killed") == esm.kills
     assert res["queues"]["dead_letter"]["visible"] == 0
     # the queue fanned work out across several concurrent workers, inside the mapping limits
-    assert 3 <= s["workers_peak"] <= 8
+    assert 3 <= s["workers_peak"] <= 8 + esm.kills     # a dead env's last moments can overlap its replacement
     assert max(run["timeline"]["rebooking"]) <= 5 and max(run["timeline"]["rerouting"]) <= 3
     assert s["workers_used"] >= 5
     assert not any(esm.enabled.values())                      # completion switched mappings off
@@ -231,7 +233,7 @@ def test_autoscaled_run_with_killed_workers_loses_nothing(env):
     before = {r["case_id"]: r["fencing_token"] for r in run["records"]}
     for t in threads:
         t.join(5)
-    assert http(handler, "POST", "/run", reject_percent=0)[0] == 202
+    assert http(handler, "POST", "/run", reject_percent=0, kill_percent=0)[0] == 202
     res2 = wait_complete(handler)
     assert res2["latest_run"]["stats"]["avg_passes"] <= 1.1
     assert all(r["fencing_token"] > before[r["case_id"]] for r in res2["latest_run"]["records"])
@@ -251,12 +253,64 @@ def test_housekeeping_switches_off_abandoned_mappings(env):
     assert out["disabled"] and not any(esm.enabled.values())
 
 
+def test_every_kill_point_recovers_on_every_pass_in_both_modes(env):
+    """Force each kill point x mode onto first and later passes; each must recover its own way."""
+    handler, common, worker, esm, threads = env
+    points, modes = common.KILL_POINTS, common.KILL_MODES
+
+    def forced(run_id, case_id, pass_no, kill_percent):
+        n = int(case_id[-4:])
+        if n % 3:                                   # leave two thirds of records uncrashed
+            return None
+        i = n // 3 + pass_no
+        return {"at": points[i % len(points)], "mode": modes[(i // len(points)) % 2]}
+    common.crash_plan = forced                      # message_body looks it up at call time
+
+    http(handler, "POST", "/load")
+    assert http(handler, "POST", "/run", reject_percent=60, kill_percent=1)[0] == 202
+    res = wait_complete(handler, timeout=240)
+    run, s = res["latest_run"], res["latest_run"]["stats"]
+    by_point = {k["point"]: k for k in s["kills_by_point"]}
+    print(json.dumps(s["kills_by_point"], indent=1))
+    assert s["open"] == 0 and s["resolved"] + s["human_review"] == 100
+    assert s["kills_recovered"] == s["kills_fired"], [k for k in run["kills"] if not k["recovered"]]
+    for p in points:
+        assert by_point[p]["fired"] >= 1, p
+    assert {int(k["pass"]) for k in run["kills"]} >= {1, 2}
+    assert {k["mode"] for k in run["kills"]} == {"exit", "raise"}
+    # the signatures each point should leave behind
+    for k in run["kills"]:
+        rec = next(r for r in run["records"] if r["case_id"] == k["case_id"])
+        assert rec["status"] in ("resolved", "human_review"), k
+        if k["point"] in ("after_claim", "during_offer", "during_customer_response", "before_commit"):
+            assert k["recovered_by"] == "lease takeover" and k["recovery_s"] is not None, k
+    assert s["events"]["repaired"] >= by_point["after_commit_before_handoff"]["fired"]
+    assert s["events"]["stale"] >= 1                 # K7/K8: redelivered copies of finished work dropped
+    assert res["queues"]["dead_letter"]["visible"] == 0
+
+
+def test_crash_plan_is_deterministic_per_pass_and_never_copied(env):
+    _, common, *_ = env
+    plans = [common.crash_plan("run-x", f"IROPS-MSP-{i:04d}", p, 30) for i in range(1, 101) for p in (1, 2, 3)]
+    assert plans == [common.crash_plan("run-x", f"IROPS-MSP-{i:04d}", p, 30) for i in range(1, 101) for p in (1, 2, 3)]
+    hit = [p for p in plans if p]
+    assert 60 <= len(hit) <= 120                                   # ~30% of 300
+    assert {p["at"] for p in hit} == set(common.KILL_POINTS) and {p["mode"] for p in hit} == {"exit", "raise"}
+    # a case crashing on pass 1 does not inherit that crash on pass 2: each pass is its own draw
+    p1 = [common.crash_plan("run-x", f"IROPS-MSP-{i:04d}", 1, 30) for i in range(1, 101)]
+    p2 = [common.crash_plan("run-x", f"IROPS-MSP-{i:04d}", 2, 30) for i in range(1, 101)]
+    assert p1 != p2
+    assert common.crash_plan("run-x", "IROPS-MSP-0001", 1, 0) is None
+    body = json.loads(common.message_body("run-x", "IROPS-MSP-0001", 2, 0))
+    assert "crash" not in body
+
+
 def test_crash_flag_fires_only_on_first_delivery(env):
     handler, common, worker, esm, _ = env
-    rec = {"attributes": {"ApproximateReceiveCount": "1"}}
-    assert worker.crash_point(rec, {"crash": "mid_work"}) == "mid_work"
-    assert worker.crash_point({"attributes": {"ApproximateReceiveCount": "2"}}, {"crash": "mid_work"}) is None
-    assert worker.crash_point(rec, {}) is None
+    body = {"run_id": "r", "case_id": "c", "pass": 1, "crash": {"at": "after_claim", "mode": "exit"}}
+    assert worker.Crash({"attributes": {"ApproximateReceiveCount": "1"}}, body).at == "after_claim"
+    assert worker.Crash({"attributes": {"ApproximateReceiveCount": "2"}}, body).at is None
+    assert worker.Crash({"attributes": {"ApproximateReceiveCount": "1"}}, {**body, "crash": None}).at is None
 
 
 def test_zombie_write_is_fenced(env):
@@ -278,7 +332,7 @@ def test_zombie_write_is_fenced(env):
     worker.env_id = lambda: ids["who"]
     real_work = worker.simulate_work
 
-    def stall_then_rescue():
+    def stall_then_rescue(*_):
         worker.simulate_work = real_work
         time.sleep(LEASE + 0.5)               # zombie "GC pause" past its lease
         ids["who"] = "rescuer"

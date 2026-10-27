@@ -212,6 +212,46 @@ def offer_sequence(r):
     return ["HUMAN_REVIEW"] + offers if mandatory_human else offers + ["HUMAN_REVIEW"]
 
 
+# --- Crash injection ---------------------------------------------------------
+# Every place in the worker's path where a crash leaves the record in a different state.
+# Ordered as the worker reaches them; the comment is the recovery each one should trigger.
+KILL_POINTS = [
+    "on_receive",                      # K1 nothing touched yet          -> plain redelivery
+    "after_claim",                     # K2 leased, nothing decided      -> lease takeover
+    "during_offer",                    # K3 rules engine running         -> lease takeover
+    "during_customer_response",        # K4 offer out, awaiting customer -> lease takeover
+    "before_commit",                   # K5 answer known, not written    -> lease takeover
+    "after_commit_before_handoff",     # K6 pass+1 written, no message   -> handoff repair
+    "after_handoff_before_ack",        # K7 next message sent, incoming not acked -> duplicate dropped
+    "after_final_commit_before_ack",   # K8 final status written, not acked       -> finished duplicate dropped
+]
+KILL_MODES = ["exit", "raise"]         # process death vs. an exception escaping the handler
+
+
+def _h(*parts):
+    return int(hashlib.sha256("|".join(map(str, parts)).encode()).hexdigest()[:12], 16)
+
+
+def crash_plan(run_id, case_id, pass_no, kill_percent):
+    """
+    Whether the message for (run, case, pass) carries a crash, and where. Deterministic, so
+    every producer of that message (first enqueue, handoff, repair re-send) stamps the same
+    instruction, and each pass gets its own independent draw: nothing is copied forward.
+    """
+    if not kill_percent or (_h("crash?", run_id, case_id, pass_no) % 10000) / 100.0 >= float(kill_percent):
+        return None
+    return {"at": KILL_POINTS[_h("crash@", run_id, case_id, pass_no) % len(KILL_POINTS)],
+            "mode": KILL_MODES[_h("crash-mode", run_id, case_id, pass_no) % len(KILL_MODES)]}
+
+
+def message_body(run_id, case_id, pass_no, kill_percent):
+    body = {"run_id": run_id, "case_id": case_id, "pass": pass_no}
+    plan = crash_plan(run_id, case_id, pass_no, kill_percent)
+    if plan:
+        body["crash"] = plan
+    return json.dumps(body)
+
+
 def customer_rejects(run_id, case_id, pass_no, reject_percent):
     """Deterministic per (run, case, pass): a retry after a crash sees the same answer."""
     h = int(hashlib.sha256(f"{run_id}|{case_id}|{pass_no}".encode()).hexdigest()[:8], 16)

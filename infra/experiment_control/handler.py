@@ -6,7 +6,7 @@ Served publicly through a Lambda Function URL:
   GET  /results          latest run: outcomes, passes per record, oldest unpicked, workers, recent runs
   POST /reset            stop any run, purge queues, delete every item in both tables
   POST /load             paced load of the golden-set inputs (?wcu_per_sec=N)
-  POST /run              start a run (?reject_percent=50&kill_workers=0)
+  POST /run              start a run (?reject_percent=50&kill_percent=0)
 
 Workers are not launched by this function. They are the worker Lambda, invoked
 by SQS event source mappings that Lambda autoscales from queue depth. This
@@ -28,12 +28,13 @@ from datetime import datetime, timezone
 from decimal import Decimal
 
 from common import (
+    KILL_POINTS, message_body,
     DLQ, ESMS, KEY, LEASE_SECONDS, NUMERIC, RECORDS_TABLE, REBOOKING_QUEUE, REROUTING_QUEUE, RUNS_TABLE,
     TERMINAL, VISIBILITY_SECONDS, WcuPacer, consumed, ddb, dumps, from_ddb, golden, input_rows, lam, now,
     pace_rate, scan_all, sqs, to_ddb,
 )
 
-MAX_KILLS = 20
+MAX_KILL_PERCENT = 50     # every message crashing once doubles a run's work; keep runs sane
 RUN_LOCK_S = 30 * 60
 STALL_S = LEASE_SECONDS + VISIBILITY_SECONDS + 30
 RESET_SETTLE_S = float(os.environ.get("RESET_SETTLE_S", "4"))
@@ -160,11 +161,11 @@ def _int_param(params, name, default, lo, hi):
     return v
 
 
-def acquire_lock(run_id, sk, t, reject):
+def acquire_lock(run_id, sk, t, reject, kill_percent):
     ddb.put_item(
         TableName=RUNS_TABLE,
         Item=to_ddb({**CONTROL_KEY, "run_id": run_id, "summary_sk": sk, "status": "starting",
-                     "reject_percent": reject, "started_at": round(t, 3),
+                     "reject_percent": reject, "kill_percent": kill_percent, "started_at": round(t, 3),
                      "expires_at": round(t + RUN_LOCK_S, 3)}),
         ConditionExpression="attribute_not_exists(pk) OR expires_at < :t OR NOT (#st IN (:s, :r))",
         ExpressionAttributeNames={"#st": "status"},
@@ -174,27 +175,27 @@ def acquire_lock(run_id, sk, t, reject):
 
 def start_run(params):
     reject = _int_param(params, "reject_percent", 50, 0, 100)
-    kills = _int_param(params, "kill_workers", 0, 0, MAX_KILLS)
+    kill_pct = _int_param(params, "kill_percent", 0, 0, MAX_KILL_PERCENT)
     t = now()
     stamp = datetime.fromtimestamp(t, timezone.utc)
     run_id = f"run-{stamp:%Y%m%d-%H%M%S}-{random.randint(0, 0xffff):04x}"
     sk = f"{stamp.isoformat(timespec='seconds')}#{run_id}"
     try:
-        acquire_lock(run_id, sk, t, reject)
+        acquire_lock(run_id, sk, t, reject, kill_pct)
     except ddb.exceptions.ConditionalCheckFailedException:
         results(force=True)                     # marks the current run complete if it is
         try:
-            acquire_lock(run_id, sk, now(), reject)
+            acquire_lock(run_id, sk, now(), reject, kill_pct)
         except ddb.exceptions.ConditionalCheckFailedException:
             raise HttpError(409, "a run is already in progress; wait for it to finish or POST /reset")
     max_workers = sum(e["max"] for e in ESMS.values())
     summary = {"pk": "RUN", "sk": sk, "run_id": run_id, "status": "starting", "started_at": round(t, 3),
-               "reject_percent": reject, "kill_workers": kills, "max_workers": max_workers}
+               "reject_percent": reject, "kill_percent": kill_pct, "max_workers": max_workers}
     ddb.put_item(TableName=RUNS_TABLE, Item=to_ddb(summary))
     lam.invoke(FunctionName=os.environ["AWS_LAMBDA_FUNCTION_NAME"], InvocationType="Event",
                Payload=json.dumps({"internal": "start_run", **summary}).encode())
     _cache.clear()
-    return {"run_id": run_id, "status": "starting", "reject_percent": reject, "kill_workers": kills,
+    return {"run_id": run_id, "status": "starting", "reject_percent": reject, "kill_percent": kill_pct,
             "workers": f"autoscaled by SQS, up to {max_workers}"}
 
 
@@ -243,22 +244,15 @@ def run_async(ev):
     queued_at = round(now(), 3)
     set_run_status(run_id, sk, "running", records=len(cases), queued_at=queued_at, worker_mappings=esm)
 
-    # Crashes travel on the messages: N random first-pass messages tell whichever worker
-    # receives them to die at a given point. Nothing tracks or assigns them centrally.
-    kill_cases = {c: random.choice(["mid_work", "after_commit"])
-                  for c in random.sample(cases, min(ev["kill_workers"], len(cases)))}
-
-    def body(c):
-        b = {"run_id": run_id, "case_id": c, "pass": 1}
-        if c in kill_cases:
-            b["crash"] = kill_cases[c]
-        return json.dumps(b)
-
+    # Crashes travel on the messages. Each producer stamps its own messages from the same
+    # deterministic draw per (run, case, pass): here pass 1, in the worker every later pass.
+    kill_pct = ev.get("kill_percent", 0)
     for i in range(0, len(cases), 10):
         sqs.send_message_batch(QueueUrl=REBOOKING_QUEUE, Entries=[
-            {"Id": str(j), "MessageBody": body(c)} for j, c in enumerate(cases[i:i + 10])])
-    print(dumps({"run_id": run_id, "records": len(cases), "kill_cases": kill_cases, "esm": esm}))
-    return {"run_id": run_id, "records": len(cases), "kill_cases": kill_cases}
+            {"Id": str(j), "MessageBody": message_body(run_id, c, 1, kill_pct)}
+            for j, c in enumerate(cases[i:i + 10])])
+    print(dumps({"run_id": run_id, "records": len(cases), "kill_percent": kill_pct, "esm": esm}))
+    return {"run_id": run_id, "records": len(cases)}
 
 
 # --- results -----------------------------------------------------------------
@@ -289,19 +283,23 @@ def worker_activity(rows, kills, start, end, t):
     a worker handles leaves a [claim, commit] interval in the record's history, a record
     being worked right now has a live lease, and a killed worker left a KILL item.
     """
-    killed_envs = {k["worker"] for k in kills if k.get("worker")}
+    killed_envs = {k["worker"] for k in kills if k.get("worker") and k.get("mode", "exit") == "exit"}
+    faulted = {(k["worker"], k["case_id"], int(k.get("pass", 1))) for k in kills}   # their leases are abandoned
     intervals = []   # (start, end, env, pool)
     for r in rows:
         for h in r.get("history", []):
             if "c" in h:
                 intervals.append((float(h["c"]), float(h["t"]), h["w"], "rebooking" if int(h["p"]) == 1 else "rerouting"))
         if (r.get("status") == "in_progress" and r.get("lease_owner") not in killed_envs
+                and (r.get("lease_owner"), r[KEY], int(r.get("pass_no", 1))) not in faulted
                 and float(r.get("lease_expires", 0)) > t):
             pool = "rebooking" if int(r.get("pass_no", 1)) == 1 else "rerouting"
             intervals.append((float(r.get("claimed_at", t)), t, r["lease_owner"], pool))
     for k in kills:
         if k.get("worker"):
-            intervals.append((float(k["claimed_at"]), float(k["killed_at"]), k["worker"], "rebooking"))
+            began = float(k.get("claimed_at") or k.get("started_at") or k["killed_at"])
+            pool = "rebooking" if int(k.get("pass", 1)) == 1 else "rerouting"
+            intervals.append((began, float(k["killed_at"]), k["worker"], pool))
     # One claim = one interval. A worker killed after committing appears in both the record's
     # history and its kill entry; keep the longer of the two.
     by_claim = {}
@@ -315,7 +313,7 @@ def worker_activity(rows, kills, start, end, t):
     envs = {}
     for a, b, env, pool in intervals:
         e = envs.setdefault(env, {"worker_id": env, "first_seen": a, "last_seen": b, "passes": 0,
-                                  "pools": set(), "takeovers": 0, "killed": env in killed_envs})
+                                  "pools": set(), "takeovers": 0, "faults": 0, "killed": env in killed_envs})
         e["first_seen"], e["last_seen"] = min(e["first_seen"], a), max(e["last_seen"], b)
         e["pools"].add(pool)
     for r in rows:
@@ -323,8 +321,13 @@ def worker_activity(rows, kills, start, end, t):
             if h.get("w") in envs:
                 envs[h["w"]]["passes"] += 1
                 envs[h["w"]]["takeovers"] += 1 if "from" in h else 0
+    for k in kills:
+        if k.get("worker") in envs and k.get("mode") == "raise":
+            envs[k["worker"]]["faults"] += 1
     busy_now = {r["lease_owner"] for r in rows if r.get("status") == "in_progress"
-                and r.get("lease_owner") not in killed_envs and float(r.get("lease_expires", 0)) > t}
+                and r.get("lease_owner") not in killed_envs
+                and (r.get("lease_owner"), r[KEY], int(r.get("pass_no", 1))) not in faulted
+                and float(r.get("lease_expires", 0)) > t}
     workers = []
     for e in sorted(envs.values(), key=lambda x: x["first_seen"]):
         state = "killed" if e["killed"] else ("busy" if e["worker_id"] in busy_now else "idle")
@@ -361,6 +364,62 @@ def concurrency_timeline(intervals, start, end):
             i += 1
         out["rebooking"][b], out["rerouting"][b], out["total"][b] = peak["rebooking"], peak["rerouting"], peak_total
     return out
+
+
+RECOVERY = {
+    "on_receive": "redelivered",
+    "after_claim": "lease takeover", "during_offer": "lease takeover",
+    "during_customer_response": "lease takeover", "before_commit": "lease takeover",
+    "after_commit_before_handoff": "handoff repaired",
+    "after_handoff_before_ack": "duplicate dropped",
+    "after_final_commit_before_ack": "finished duplicate dropped",
+}
+
+
+def attribute_kills(kills, rows):
+    """
+    For each crash, check the record for the recovery that crash point should have caused,
+    and how long it took. Recovered = the record moved past the crashed pass (or finished)
+    and, for crashes holding a lease, the next claim of that pass shows a takeover from it.
+    """
+    out = []
+    for k in sorted(kills, key=lambda k: float(k["killed_at"])):
+        r = rows.get(k["case_id"], {})
+        p = int(k.get("pass", 1))
+        hist = r.get("history", [])
+        moved_on = r.get("status") in TERMINAL or int(r.get("pass_no", 0)) > p
+        how = RECOVERY.get(k["point"], "?")
+        nxt = None
+        if how in ("redelivered", "lease takeover"):
+            done = [h for h in hist if int(h["p"]) == p]
+            nxt = done[0] if done else None
+            recovered = bool(nxt) and (how == "redelivered" or nxt.get("from") == k["worker"])
+            if how == "redelivered" and nxt and nxt.get("from"):
+                how = "redelivered (after a takeover)"
+        elif how == "handoff repaired":
+            later = [h for h in hist if int(h["p"]) == p + 1]
+            nxt = later[0] if later else None
+            recovered = moved_on and (bool(nxt) or r.get("status") in TERMINAL)
+        else:                                    # the work itself was done before the crash
+            recovered = moved_on
+        out.append({**k, "recovered": bool(recovered), "recovered_by": how,
+                    "recovery_s": round(float(nxt["c"]) - float(k["killed_at"]), 1) if nxt and "c" in nxt else None})
+    return out
+
+
+def kills_by_point(fired):
+    rows = []
+    for point in KILL_POINTS:
+        ks = [k for k in fired if k["point"] == point]
+        waits = [k["recovery_s"] for k in ks if k["recovery_s"] is not None]
+        rows.append({"point": point, "fired": len(ks),
+                     "exit": sum(1 for k in ks if k.get("mode") == "exit"),
+                     "raise": sum(1 for k in ks if k.get("mode") == "raise"),
+                     "recovered": sum(1 for k in ks if k["recovered"]),
+                     "recovered_by": RECOVERY[point],
+                     "passes": sorted({int(k.get("pass", 1)) for k in ks}),
+                     "avg_recovery_s": round(sum(waits) / len(waits), 1) if waits else None})
+    return rows
 
 
 def results(force=False):
@@ -411,7 +470,7 @@ def results(force=False):
             "urgency": r.get("urgency"), "cabin": r.get("cabin"), "destination": r.get("destination"),
             "party_size": r.get("party_size"), "travel_concerns": r.get("travel_concerns"),
             "queued_at": r.get("queued_at"), "resolved_at": r.get("resolved_at"),
-            "killed_here": any(k["case_id"] == r[KEY] for k in kills),
+            "crashes_here": sum(1 for k in kills if k["case_id"] == r[KEY]),
         })
 
     open_rows = [r for r in rows if r.get("status") not in TERMINAL]
@@ -431,7 +490,7 @@ def results(force=False):
     live = run["status"] in ACTIVE and t - started < RUN_LOCK_S
     end = finished_at or (t if live else last_activity)
     activity = worker_activity(rows, kills, started, end, t)
-    fired = kills
+    fired = attribute_kills(kills, {r[KEY]: r for r in rows})
     stats = {
         "records": len(rows), "status_counts": status_counts,
         "resolved": status_counts.get("resolved", 0), "human_review": status_counts.get("human_review", 0),
@@ -440,7 +499,8 @@ def results(force=False):
         "avg_passes": round(sum(k * v for k, v in passes.items()) / max(1, sum(passes.values())), 2),
         "oldest_unpicked": oldest(queued), "oldest_unresolved": oldest(open_rows),
         "takeovers_after_crash": takeovers,
-        "kills_planned": int(run.get("kill_workers", 0)), "kills_fired": len(fired),
+        "kills_fired": len(fired), "kills_recovered": sum(1 for k in fired if k["recovered"]),
+        "kills_by_point": kills_by_point(fired),
         "events": {k: int(events.get(k, 0)) for k in ("fenced", "repaired", "stale", "deferred")},
         "workers_busy_now": activity["busy_now"], "workers_peak": activity["peak"],
         "workers_used": activity["used"], "first_claim_s": activity["first_claim_s"],
