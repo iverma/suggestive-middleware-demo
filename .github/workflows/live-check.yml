@@ -17,6 +17,7 @@ on:
     paths:
       - ".github/workflows/live-check.yml"
       - "scripts/live_check.py"
+      - "scripts/split_brain_check.py"
 
 permissions:
   contents: read
@@ -40,3 +41,12 @@ jobs:
           "${{ inputs.reject_percent || '50' }}" "${{ inputs.kill_percent || '10' }}"
           "${{ inputs.slow_percent || '4' }}" "${{ inputs.dup_percent || '20' }}"
           "${{ inputs.poison_percent || '2' }}" "${{ inputs.throttle_percent || '10' }}"
+
+  split-brain:
+    # Two clients racing each other on the same deployment, alongside the run above.
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Concurrent runs from two clients, double submit, stale cancel
+        run: python3 scripts/split_brain_check.py "$DEMO_URL"

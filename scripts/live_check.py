@@ -13,7 +13,9 @@ gets two results for one pass.
 import json
 import sys
 import time
+import urllib.error
 import urllib.request
+import uuid
 
 
 def call(base, method, path):
@@ -28,16 +30,16 @@ def main(base, reject="50", kill_percent="10", slow_percent="0", dup_percent="0"
     if before["records_in_table"] == 0:
         print("no records loaded; loading the golden set first")
         print(call(base, "POST", "/load"))
-    run = call(base, "POST", f"/run?reject_percent={reject}&kill_percent={kill_percent}"
+    run = call(base, "POST", f"/run?kind=integration&client_token={uuid.uuid4()}&reject_percent={reject}&kill_percent={kill_percent}"
                              f"&slow_percent={slow_percent}&dup_percent={dup_percent}"
                              f"&poison_percent={poison_percent}&throttle_percent={throttle_percent}")
     print("started", run)
     end = time.time() + timeout_s
     while time.time() < end:
         time.sleep(5)
-        res = call(base, "GET", "/results")
+        res = call(base, "GET", f"/results?run={run['run_id']}")
         lr = res["latest_run"]
-        if not lr or lr["run_id"] != run["run_id"]:
+        if not lr:
             continue
         s = lr["stats"]
         print(f"{s['duration_s']:6.1f}s {lr['status']:9} closed={s['resolved'] + s['human_review']}/{s['records']} "
@@ -50,7 +52,7 @@ def main(base, reject="50", kill_percent="10", slow_percent="0", dup_percent="0"
         print("::error::run did not finish in time")
         return 1
     time.sleep(8)                                    # let the mapping switch-off settle, then confirm it
-    res = call(base, "GET", "/results")
+    res = call(base, "GET", f"/results?run={run['run_id']}")
     # A duplicate copy of a poison message can reach the dead-letter queue after its record was
     # already swept; the sweeper drops such stale copies on its next tick (every minute).
     for _ in range(9):
@@ -58,7 +60,7 @@ def main(base, reject="50", kill_percent="10", slow_percent="0", dup_percent="0"
             break
         print("waiting for the sweeper to drain", res["queues"]["dead_letter"])
         time.sleep(15)
-        res = call(base, "GET", "/results")
+        res = call(base, "GET", f"/results?run={run['run_id']}")
     maps = {k: v["state"] for k, v in res["worker_mappings"].items()}
     s = res["latest_run"]["stats"]
     print(json.dumps({"mappings_after": maps, "timeline_total": res["latest_run"]["timeline"]["total"]}))
@@ -95,7 +97,7 @@ def main(base, reject="50", kill_percent="10", slow_percent="0", dup_percent="0"
           and not unrecovered and (s["kills_fired"] > 0 or float(kill_percent) == 0)
           and r["double_commits"] == 0 and r["zombies_fenced"] + r["zombies_uncontested"] == r["zombies"]
           and res["queues"]["dead_letter"]["visible"] == 0
-          and all(v in ("Disabled", "Disabling") for v in maps.values()))
+          and (res["active_runs"] or all(v in ("Disabled", "Disabling") for v in maps.values())))
     if not ok:
         print(f"::error::run not clean: status={res['latest_run']['status']} open={s['open']} "
               f"crashes recovered={s['kills_recovered']}/{s['kills_fired']} double results={r['double_commits']} "
