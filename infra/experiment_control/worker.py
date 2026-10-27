@@ -220,7 +220,7 @@ def stall_past_timeout(crash, deadline):
         "case_id": crash.case_id, "pass": crash.pass_no, "planned": "stalled_past_timeout",
         "point": "stalled_past_timeout", "mode": "timeout", "queue": crash.queue, "worker": env_id(),
         "started_at": round(crash.started_at, 3), "claimed_at": round(crash.claimed_at, 3),
-        "killed_at": round(deadline, 3)}))
+        "killed_at": round(now(), 3), "timeout_at": round(deadline, 3)}))   # killed_at = when it hung
     print(json.dumps({"worker": env_id(), "event": "stall_past_timeout", "case_id": crash.case_id,
                       "pass": crash.pass_no}))
     time.sleep(max(0.0, deadline - now()) + 1.0)
