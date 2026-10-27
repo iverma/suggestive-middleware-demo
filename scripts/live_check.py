@@ -1,9 +1,14 @@
 """
-Live check against the deployed demo: start a run with killed workers, wait for
-it to finish, and fail if any customer record was lost or left open, if a
-planned crash didn't fire, or if the worker mappings were left polling.
+Live check against the deployed demo: start a run where a share of worker
+passes crash (at any of the 8 kill points, process exit or exception), wait for
+it to finish, and fail if any customer record was lost or left open, if any
+crash wasn't recovered the way its kill point predicts, or if the worker
+mappings were left polling.
 
-    python3 scripts/live_check.py https://<id>.lambda-url.<region>.on.aws/ 50 3
+Also races slow workers and duplicate deliveries, and fails if any record ever
+gets two results for one pass.
+
+    python3 scripts/live_check.py https://<id>.lambda-url.<region>.on.aws/ <reject%> <crash%> <slow%> <dup%>
 """
 import json
 import sys
@@ -17,12 +22,13 @@ def call(base, method, path):
         return json.loads(r.read())
 
 
-def main(base, reject="50", kills="3", timeout_s=780):
+def main(base, reject="50", kill_percent="10", slow_percent="0", dup_percent="0", timeout_s=900):
     before = call(base, "GET", "/results")
     if before["records_in_table"] == 0:
         print("no records loaded; loading the golden set first")
         print(call(base, "POST", "/load"))
-    run = call(base, "POST", f"/run?reject_percent={reject}&kill_workers={kills}")
+    run = call(base, "POST", f"/run?reject_percent={reject}&kill_percent={kill_percent}"
+                             f"&slow_percent={slow_percent}&dup_percent={dup_percent}")
     print("started", run)
     end = time.time() + timeout_s
     while time.time() < end:
@@ -34,7 +40,7 @@ def main(base, reject="50", kills="3", timeout_s=780):
         s = lr["stats"]
         print(f"{s['duration_s']:6.1f}s {lr['status']:9} closed={s['resolved'] + s['human_review']}/{s['records']} "
               f"busy={s['workers_busy_now']} peak={s['workers_peak']} used={s['workers_used']} "
-              f"killed={s['kills_fired']} takeovers={s['takeovers_after_crash']} events={s['events']} "
+              f"crashes={s['kills_recovered']}/{s['kills_fired']} takeovers={s['takeovers_after_crash']} events={s['events']} "
               f"queues={ {k: v['visible'] + v['in_flight'] for k, v in res['queues'].items()} }")
         if lr["status"] in ("complete", "failed"):
             break
@@ -45,20 +51,38 @@ def main(base, reject="50", kills="3", timeout_s=780):
     res = call(base, "GET", "/results")
     maps = {k: v["state"] for k, v in res["worker_mappings"].items()}
     s = res["latest_run"]["stats"]
-    print(json.dumps({"stats": s, "mappings_after": maps,
-                      "kills": [(k["worker"], k["stage"], k["case_id"]) for k in res["latest_run"]["kills"]],
-                      "timeline_total": res["latest_run"]["timeline"]["total"]}, indent=1))
+    print(json.dumps({"mappings_after": maps, "timeline_total": res["latest_run"]["timeline"]["total"]}))
+    print(f"{'kill point':32} {'crashed':>7} {'exit':>4} {'raise':>5} {'passes':12} {'recovered':>9}  recovered by (avg s)")
+    for k in s["kills_by_point"]:
+        print(f"{k['point']:32} {k['fired']:7} {k['exit']:4} {k['raise']:5} {str(k['passes']):12} {k['recovered']:9}  "
+              f"{k['recovered_by']} ({k['avg_recovery_s']})")
+    print("::notice title=Crashes by kill point (recovered/crashed, exit+raise, passes, avg s to recover)::" + "; ".join(
+        f"K{i + 1} {k['point']}: {k['recovered']}/{k['fired']} ({k['exit']}+{k['raise']}) p{k['passes']} {k['avg_recovery_s']}s"
+        for i, k in enumerate(s["kills_by_point"])))
+    r = s["races"]
+    print(f"::notice title=Races::{r['duplicates_sent']} duplicate deliveries ({r['duplicates_held_back']} held back, "
+          f"{r['duplicates_dropped']} dropped); {r['zombies']} zombies ({r['zombies_fenced']} fenced, "
+          f"{r['zombies_uncontested']} uncontested); {s['events']['fenced']} late writes fenced in all; "
+          f"records with two results for one pass: {r['double_commits']}")
+    unrecovered = [k for k in res["latest_run"]["kills"] if not k["recovered"]]
+    for k in unrecovered:
+        print("::warning::not recovered:", json.dumps(k))
     print(f"::notice title=Live run {lr['run_id']}::{s['resolved']} accepted ({s['satisfactory']} inside golden set), "
           f"{s['human_review']} to a person, {s['open']} open, avg {s['avg_passes']} passes in {s['duration_s']}s. "
           f"Workers autoscaled to a peak of {s['workers_peak']} ({s['workers_used']} environments). "
-          f"{s['kills_fired']} killed: {s['takeovers_after_crash']} records taken over, "
-          f"{s['events']['repaired']} handoffs repaired, {s['events']['stale']} finished duplicates dropped. "
+          f"{s['kills_fired']} crashes at {sum(1 for k in s['kills_by_point'] if k['fired'])} of 8 kill points, "
+          f"on passes {sorted({p for k in s['kills_by_point'] for p in k['passes']})}: "
+          f"{s['kills_recovered']} recovered ({s['takeovers_after_crash']} lease takeovers, "
+          f"{s['events']['repaired']} handoffs repaired, {s['events']['stale']} duplicates dropped). "
           f"Mappings after: {maps}")
     ok = (res["latest_run"]["status"] == "complete" and s["open"] == 0 and s["records"] == 100
-          and s["kills_fired"] == int(kills) and all(v in ("Disabled", "Disabling") for v in maps.values()))
+          and not unrecovered and (s["kills_fired"] > 0 or float(kill_percent) == 0)
+          and r["double_commits"] == 0 and r["zombies_fenced"] + r["zombies_uncontested"] == r["zombies"]
+          and all(v in ("Disabled", "Disabling") for v in maps.values()))
     if not ok:
         print(f"::error::run not clean: status={res['latest_run']['status']} open={s['open']} "
-              f"killed={s['kills_fired']}/{kills} mappings={maps}")
+              f"crashes recovered={s['kills_recovered']}/{s['kills_fired']} double results={r['double_commits']} "
+              f"mappings={maps}")
     return 0 if ok else 1
 
 

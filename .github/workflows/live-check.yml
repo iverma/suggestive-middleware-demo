@@ -1,13 +1,15 @@
 name: Live check
 
-# Starts a real run against the deployed demo with killed workers and fails if any
-# record is lost or left open. Run by hand from the Actions tab (or push a change to
+# Starts a real run against the deployed demo with crashing workers and fails if any
+# record is lost or left open, or any crash isn't recovered. Run by hand from the Actions tab (or push a change to
 # this file / the script). Uses only the public URL, no AWS credentials.
 on:
   workflow_dispatch:
     inputs:
       reject_percent: { description: "Reject %", default: "50" }
-      kill_workers: { description: "Workers to kill", default: "3" }
+      kill_percent: { description: "Crash % of worker passes", default: "10" }
+      slow_percent: { description: "Slow % (zombies and timeouts)", default: "4" }
+      dup_percent: { description: "Duplicate delivery %", default: "20" }
   push:
     branches: [main]
     paths:
@@ -27,10 +29,11 @@ env:
 jobs:
   live:
     runs-on: ubuntu-latest
-    timeout-minutes: 16
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - name: Run with killed workers and verify nothing is lost
         run: >
           python3 scripts/live_check.py "$DEMO_URL"
-          "${{ inputs.reject_percent || '50' }}" "${{ inputs.kill_workers || '3' }}"
+          "${{ inputs.reject_percent || '50' }}" "${{ inputs.kill_percent || '10' }}"
+          "${{ inputs.slow_percent || '4' }}" "${{ inputs.dup_percent || '20' }}"
