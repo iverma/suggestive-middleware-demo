@@ -18,7 +18,16 @@ REBOOKING_QUEUE = os.environ.get("REBOOKING_QUEUE_URL", "")
 REROUTING_QUEUE = os.environ.get("REROUTING_QUEUE_URL", "")
 DLQ = os.environ.get("DLQ_URL", "")
 WORKER_FUNCTION = os.environ.get("WORKER_FUNCTION", "")
-LEASE_SECONDS = int(os.environ.get("LEASE_SECONDS", "30"))       # == SQS visibility timeout
+# Lease < queue visibility timeout: when SQS redelivers a dead worker's message, its lease is over.
+LEASE_SECONDS = int(os.environ.get("LEASE_SECONDS", "15"))
+VISIBILITY_SECONDS = int(os.environ.get("VISIBILITY_SECONDS", "20"))
+# Event source mappings (queue -> worker): uuid and max concurrency, "rebooking" and "rerouting".
+ESMS = {
+    "rebooking": {"uuid": os.environ.get("REBOOKING_ESM_ID", ""),
+                  "max": int(os.environ.get("REBOOKING_MAX_WORKERS", "5"))},
+    "rerouting": {"uuid": os.environ.get("REROUTING_ESM_ID", ""),
+                  "max": int(os.environ.get("REROUTING_MAX_WORKERS", "3"))},
+}
 CSV_PATH = os.environ.get("CSV_PATH", os.path.join(os.path.dirname(__file__), "golden_set_irops_msp.csv"))
 STOP_AT = "acceptable_resolutions"
 KEY = "case_id"

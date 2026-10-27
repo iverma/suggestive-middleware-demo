@@ -8,13 +8,21 @@
 <link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=Barlow+Condensed:wght@500;600;700&display=swap" rel="stylesheet">
 <style>
   :root {
-    --bg: #E6ECEF; --panel: #F5F8F9; --ink: #1C2A36; --muted: #5B6B78; --line: #C9D3DA;
+    --bg: #E6ECEF; --panel: #F5F8F9; --ink: #1C2A36; --muted: #5B6B78; --line: #C9D3DA; --grid: #D3DCE2;
     --queued: #93A3B0; --inflight: #D99A00; --resolved: #2E7A57; --human: #6D4BA8; --bad: #B23B2E;
-    --focus: #1F6FB2;
+    --focus: #1F6FB2; --pool-1: #2a78d6; --pool-2: #e87ba4;
   }
   @media (prefers-color-scheme: dark) {
-    :root { --bg: #16212B; --panel: #1E2B36; --ink: #E3EAEF; --muted: #9AABB8; --line: #31424F;
-            --queued: #5E7182; --inflight: #E6A915; --resolved: #3F9A6F; --human: #8C6BC9; --bad: #D9594A; --focus: #6AAEE8; }
+    :root:not([data-theme="light"]) {
+      --bg: #16212B; --panel: #1E2B36; --ink: #E3EAEF; --muted: #9AABB8; --line: #31424F; --grid: #2A3A47;
+      --queued: #5E7182; --inflight: #E6A915; --resolved: #3F9A6F; --human: #8C6BC9; --bad: #D9594A; --focus: #6AAEE8;
+      --pool-1: #3987e5; --pool-2: #d55181;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #16212B; --panel: #1E2B36; --ink: #E3EAEF; --muted: #9AABB8; --line: #31424F; --grid: #2A3A47;
+    --queued: #5E7182; --inflight: #E6A915; --resolved: #3F9A6F; --human: #8C6BC9; --bad: #D9594A; --focus: #6AAEE8;
+    --pool-1: #3987e5; --pool-2: #d55181;
   }
   * { box-sizing: border-box; }
   body { margin: 0; background: var(--bg); color: var(--ink);
@@ -58,17 +66,33 @@
   .legend { display: flex; flex-wrap: wrap; gap: 6px 16px; margin-top: 10px; font-size: .85rem; color: var(--muted); }
   .legend i { display: inline-block; width: 12px; height: 12px; border-radius: 2px; margin-right: 6px; vertical-align: -1px; }
 
-  .runbox dl { margin: 0; display: grid; grid-template-columns: auto 1fr; gap: 6px 14px; }
+  .clock { font-family: "Barlow Condensed", sans-serif; font-weight: 700; font-size: 3.6rem; line-height: 1;
+           font-variant-numeric: tabular-nums; margin: 6px 0 2px; }
+  .clock-note { color: var(--muted); font-size: .9rem; margin: 0; }
+  .workers-now { display: flex; align-items: baseline; gap: 10px; margin: 16px 0 4px; }
+  .workers-now .n { font-family: "Barlow Condensed", sans-serif; font-weight: 700; font-size: 2.6rem; line-height: 1;
+                    font-variant-numeric: tabular-nums; }
+  .runbox dl { margin: 14px 0 0; display: grid; grid-template-columns: auto 1fr; gap: 6px 14px; }
   .runbox dt { color: var(--muted); }
   .runbox dd { margin: 0; font-weight: 700; }
-  .big { font-size: 3rem; line-height: 1; font-weight: 700; }
   .runstate { display: inline-block; padding: 2px 8px; border-radius: 3px; font-weight: 700; font-size: .85rem;
-              background: var(--line); color: var(--ink); }
+              background: var(--line); color: var(--ink); vertical-align: 3px; }
   .runstate.running, .runstate.starting { background: var(--inflight); color: #1C2A36; }
   .runstate.complete { background: var(--resolved); color: #fff; }
   .runstate.stalled, .runstate.failed { background: var(--bad); color: #fff; }
 
   section { margin-top: 36px; }
+  .chart-head { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: baseline; gap: 6px 20px; }
+  .series-key { display: flex; flex-wrap: wrap; gap: 6px 18px; font-size: .9rem; }
+  .series-key i { display: inline-block; width: 12px; height: 12px; border-radius: 2px; margin-right: 6px; vertical-align: -1px; }
+  .chart { position: relative; margin-top: 8px; }
+  .chart svg { display: block; width: 100%; height: 220px; overflow: visible; }
+  .chart .axis { fill: var(--muted); font-size: 12px; font-family: "Atkinson Hyperlegible", sans-serif; }
+  .tip { position: absolute; pointer-events: none; background: var(--panel); border: 1px solid var(--line);
+         border-radius: 4px; padding: 6px 9px; font-size: .85rem; white-space: nowrap; transform: translate(-50%, -100%);
+         box-shadow: 0 2px 6px rgba(28, 42, 54, .12); }
+  .tip[hidden] { display: none; }
+  .tip b { font-variant-numeric: tabular-nums; }
   .cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 28px; }
   .bars { display: grid; gap: 6px; }
   .bar { display: grid; grid-template-columns: 80px 1fr 40px; gap: 8px; align-items: center; font-size: .9rem; }
@@ -81,7 +105,7 @@
   .scroll { overflow-x: auto; }
   .ws { font-weight: 700; }
   .ws.killed { color: var(--bad); }
-  .ws.running { color: var(--inflight); }
+  .ws.busy { color: var(--inflight); }
   .offers { color: var(--muted); font-size: .85rem; }
   .offers b { color: var(--ink); font-weight: 700; }
   tr.sel { background: var(--panel); }
@@ -96,12 +120,11 @@
   <header>
     <div>
       <h1>MSP re-booking desk</h1>
-      <p class="sub">Winter-storm cancellations, re-booked by a pool of workers you can kill mid-flight. Every record should end resolved or with a human, none lost.</p>
+      <p class="sub">Winter-storm cancellations, re-booked by workers that scale with the queue. Kill some mid-flight: every record should still end accepted or with a person, none lost.</p>
     </div>
     <form class="controls" id="controls">
-      <label>Workers <input type="number" id="workers" min="1" max="8" value="4"></label>
       <label>Reject % <input type="number" id="reject" min="0" max="100" value="50"></label>
-      <label>Kill workers <input type="number" id="kill" min="0" max="7" value="0"></label>
+      <label>Kill workers <input type="number" id="kill" min="0" max="20" value="0"></label>
       <button type="submit" class="primary" id="btn-run">Start run</button>
       <button type="button" id="btn-load">Load records</button>
       <button type="button" id="btn-reset">Reset</button>
@@ -125,10 +148,26 @@
     <aside class="runbox" id="runbox"></aside>
   </div>
 
+  <section>
+    <div class="chart-head">
+      <h2>Workers over time</h2>
+      <div class="series-key" id="series-key"></div>
+    </div>
+    <div class="chart" id="chart">
+      <svg id="chart-svg" role="img" aria-label="Busy workers per second during the latest run"></svg>
+      <div class="tip" id="tip" hidden></div>
+    </div>
+  </section>
+
   <section class="cols">
     <div><h2>Passes to close a record</h2><div class="bars" id="passes"></div></div>
-    <div><h2>Workers</h2><div class="scroll"><table id="workers-t"></table></div></div>
-    <div><h2>Queues</h2><div class="scroll"><table id="queues-t"></table></div></div>
+    <div><h2>Queues and scaling</h2><div class="scroll"><table id="queues-t"></table></div></div>
+  </section>
+
+  <section>
+    <h2>Workers in the latest run</h2>
+    <p class="empty-note" style="margin:-4px 0 10px">Each row is one Lambda execution environment the queue scaled up. Busy workers hold a lease on a record right now.</p>
+    <div class="scroll"><table id="workers-t"></table></div>
   </section>
 
   <section>
@@ -144,12 +183,18 @@
 
 <script>
 const $ = (id) => document.getElementById(id);
-let data = null, busy = false, timer = null, selected = null;
+let data = null, busy = false, timer = null, selected = null, clockOffset = 0;
+const ACTIVE = ["starting", "running", "stalled"];
+const POOLS = [["rebooking", "First-pass workers", "--pool-1"], ["rerouting", "Re-route workers", "--pool-2"]];
 
 function esc(s) { return String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
-function ago(s) { if (s == null) return "–"; s = Math.round(s); return s < 90 ? `${s}s` : `${Math.round(s/60)}m`; }
+function ago(s) { if (s == null) return "–"; s = Math.round(s); return s < 90 ? `${s}s` : `${Math.floor(s/60)}m ${s%60}s`; }
+function clock(s) { if (s == null || s < 0) s = 0; const m = Math.floor(s / 60); const r = s - m * 60;
+  return `${m}:${r.toFixed(1).padStart(4, "0")}`; }
+function mmss(s) { const m = Math.floor(s / 60); return `${m}:${String(Math.floor(s % 60)).padStart(2, "0")}`; }
 function when(t) { return t ? new Date(t * 1000).toLocaleTimeString() : "–"; }
 function say(msg, err) { $("status").textContent = msg; $("status").className = err ? "err" : ""; }
+function css(v) { return getComputedStyle(document.documentElement).getPropertyValue(v).trim(); }
 
 async function call(path, label) {
   if (busy) return;
@@ -159,31 +204,43 @@ async function call(path, label) {
     const r = await fetch(path, { method: "POST" });
     const body = await r.json();
     if (!r.ok) throw new Error(body.error || r.statusText);
-    if (path.startsWith("/run")) say(`Run ${body.run_id} started with ${body.workers} workers, ${body.reject_percent}% rejections, ${body.kill_workers} to be killed.`);
+    if (path.startsWith("/run")) say(`Run ${body.run_id} started: ${body.reject_percent}% rejections, ${body.kill_workers} workers to kill, workers ${body.workers}.`);
     else if (path === "/load") say(`Loaded ${body.loaded} records in ${body.seconds}s (${body.wcu_per_sec_actual} write units/s).`);
-    else say(`Reset: deleted ${body.deleted_records} records and ${body.deleted_run_items} run items.`);
+    else say(`Reset: deleted ${body.deleted_records} records and ${body.deleted_run_items} run items. Workers switched off.`);
   } catch (e) { say(`${label} failed: ${e.message}`, true); }
   finally { busy = false; document.querySelectorAll("button").forEach(b => b.disabled = false); refresh(); }
 }
 
 $("controls").addEventListener("submit", (e) => {
   e.preventDefault();
-  const q = new URLSearchParams({ workers: $("workers").value, reject_percent: $("reject").value, kill_workers: $("kill").value });
+  const q = new URLSearchParams({ reject_percent: $("reject").value, kill_workers: $("kill").value });
   call(`/run?${q}`, "Starting run");
 });
 $("btn-load").onclick = () => call("/load", "Loading records");
 $("btn-reset").onclick = () => { if (confirm("Delete all records and run history?")) call("/reset", "Resetting"); };
-$("workers").oninput = () => { $("kill").max = Math.max(0, $("workers").value - 1); };
 
+// --- live run clock ------------------------------------------------------------
+function elapsed(run) {
+  if (!run) return null;
+  if (!ACTIVE.includes(run.status) || run.status === "stalled") return run.stats.duration_s;
+  return (Date.now() + clockOffset) / 1000 - run.started_at;
+}
+function tick() {
+  const el = $("run-clock");
+  const run = data && data.latest_run;
+  if (el && run) el.textContent = clock(elapsed(run));
+}
+setInterval(tick, 100);
+
+// --- board ---------------------------------------------------------------------
 function renderBoard(run, total) {
   const recs = run ? run.records : [];
   const cells = recs.length ? recs : Array.from({ length: Math.max(total, 100) }, () => null);
   $("board").innerHTML = cells.map((r) => {
     if (!r) return `<div class="tile empty"><span class="id">–</span></div>`;
     const cls = [r.status, r.takeovers ? "takeover" : "", (r.status === "resolved" && !r.satisfactory) ? "unsat" : ""].join(" ");
-    const short = r.case_id.slice(-3);
     return `<button class="tile ${cls}" data-id="${esc(r.case_id)}" title="${esc(r.case_id)}: ${esc(r.status)}, pass ${r.pass_no}, fencing token ${r.fencing_token}">
-      <span class="id">${short}</span><span class="p">pass ${r.pass_no ?? "–"}, ft ${r.fencing_token ?? 0}</span></button>`;
+      <span class="id">${r.case_id.slice(-3)}</span><span class="p">pass ${r.pass_no ?? "–"}, ft ${r.fencing_token ?? 0}</span></button>`;
   }).join("");
   $("board").querySelectorAll("button.tile").forEach(b => b.onclick = () => { selected = b.dataset.id; renderDetail(); });
 }
@@ -194,33 +251,105 @@ function renderDetail() {
   if (!r) { $("detail").hidden = true; return; }
   $("detail").hidden = false;
   $("detail").innerHTML = `<strong>${esc(r.case_id)}</strong> to ${esc(r.destination)}, ${esc(r.cabin)}, party of ${r.party_size}, ${esc(r.urgency)}${r.travel_concerns !== "none" ? ", " + esc(r.travel_concerns) : ""}.
-    Fencing token ${r.fencing_token}, claimed ${r.claims ?? 0} times this run${r.lease_owner ? `, held by ${esc(r.lease_owner)}` : ""}.
+    Fencing token ${r.fencing_token}, claimed ${r.claims ?? 0} times this run${r.lease_owner ? `, held by ${esc(r.lease_owner)}` : ""}${r.killed_here ? ". A worker was killed while holding this record" : ""}.
     <ol>${r.offers.map(o => { const [off, res] = o.split(":"); return `<li>${esc(off)}: ${esc(res)}</li>`; }).join("") || "<li>No offers yet</li>"}</ol>`;
 }
 
-function renderRunbox(run) {
-  if (!run) { $("runbox").innerHTML = `<h2>No runs yet</h2><p class="empty-note">Load records, then start a run.</p>`; return; }
+// --- run box -------------------------------------------------------------------
+function renderRunbox(run, maps) {
+  const maxWorkers = Object.values(maps || {}).reduce((a, m) => a + m.max_workers, 0);
+  if (!run) { $("runbox").innerHTML = `<h2>No runs yet</h2><p class="empty-note">Load records, then start a run. Workers scale up to ${maxWorkers} as the queues fill.</p>`; return; }
   const s = run.stats;
+  const notes = [];
+  if (s.queued_s != null) notes.push(`All ${s.records} records queued at ${s.queued_s}s`);
+  if (s.first_claim_s != null) notes.push(`First worker picked one up at ${s.first_claim_s}s`);
   $("runbox").innerHTML = `
     <h2>Latest run <span class="runstate ${esc(run.status)}">${esc(run.status)}</span></h2>
-    <p class="num big">${s.resolved + s.human_review}<span style="font-size:1.4rem"> / ${s.records} closed</span></p>
+    <div class="clock" id="run-clock" aria-label="Processing time">${clock(elapsed(run))}</div>
+    <p class="clock-note">${notes.map(esc).join(". ") || "Preparing records…"}</p>
+    <div class="workers-now"><span class="n">${s.workers_busy_now}</span><span>workers busy now</span></div>
+    <p class="clock-note">Peak ${s.workers_peak} of ${maxWorkers} allowed, ${s.workers_used} used in total</p>
     <dl>
-      <dt>Accepted an offer</dt><dd>${s.resolved}</dd>
-      <dt>Inside golden set</dt><dd>${s.satisfactory}</dd>
+      <dt>Closed</dt><dd>${s.resolved + s.human_review} of ${s.records}</dd>
+      <dt>Accepted an offer</dt><dd>${s.resolved} (${s.satisfactory} inside golden set)</dd>
       <dt>Sent to a person</dt><dd>${s.human_review}</dd>
       <dt>Still open</dt><dd>${s.open}</dd>
       <dt>Average passes</dt><dd>${s.avg_passes}</dd>
       <dt>Oldest unpicked</dt><dd>${s.oldest_unpicked ? `${esc(s.oldest_unpicked.case_id)}, ${ago(s.oldest_unpicked.waiting_s)}` : "none"}</dd>
       <dt>Oldest unresolved</dt><dd>${s.oldest_unresolved ? `${esc(s.oldest_unresolved.case_id)}, ${ago(s.oldest_unresolved.waiting_s)}` : "none"}</dd>
+      <dt>Workers killed</dt><dd>${s.kills_fired} of ${s.kills_planned}</dd>
       <dt>Recovered after a crash</dt><dd>${s.takeovers_after_crash}</dd>
-      <dt>Late writes fenced off</dt><dd>${s.worker_totals.fenced}</dd>
-      <dt>Lost handoffs repaired</dt><dd>${s.worker_totals.repaired}</dd>
-      <dt>Workers alive</dt><dd>${s.workers_alive} of ${run.workers}</dd>
-      <dt>Elapsed</dt><dd>${ago(s.duration_s)}</dd>
+      <dt>Lost handoffs repaired</dt><dd>${s.events.repaired}</dd>
+      <dt>Late writes fenced off</dt><dd>${s.events.fenced}</dd>
     </dl>
-    <p class="empty-note" style="margin-top:10px">${esc(run.run_id)}: ${run.workers} workers, ${run.reject_percent}% rejections, ${run.kill_workers} killed.</p>`;
+    <p class="empty-note" style="margin-top:10px">${esc(run.run_id)}: ${run.reject_percent}% rejections, ${run.kill_workers} workers to kill.</p>`;
 }
 
+// --- workers-over-time chart ---------------------------------------------------
+function renderChart(run, maps) {
+  const svg = $("chart-svg");
+  const maxWorkers = Object.values(maps || {}).reduce((a, m) => a + m.max_workers, 0) || 8;
+  const tl = run && run.timeline;
+  const n = tl ? tl.total.length : 0;
+  const last = n ? n - 1 : 0;
+  $("series-key").innerHTML = POOLS.map(([k, label, v]) =>
+    `<span><i style="background:var(${v})"></i>${label} <b>${tl ? tl[k][last] : 0}</b> now, peak <b>${tl ? Math.max(0, ...tl[k]) : 0}</b></span>`).join("") +
+    `<span>Vertical line: a worker was killed</span>`;
+  const W = svg.clientWidth || 800, H = 220, L = 30, R = 10, T = 12, B = 26;
+  const iw = W - L - R, ih = H - T - B;
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+  if (!n) { svg.innerHTML = `<text x="${L}" y="${H / 2}" class="axis">Busy workers appear here once a run starts.</text>`; return; }
+  const span = Math.max(n, 30);
+  const x = (i) => L + (i / span) * iw;
+  const yMax = Math.max(maxWorkers, Math.max(...tl.total));
+  const y = (v) => T + ih - (v / yMax) * ih;
+  const step = (vals, base) => {             // stacked step area: top edge = base+vals, bottom edge = base
+    let top = "", bot = "";
+    for (let i = 0; i < n; i++) {
+      top += `${i ? "L" : "M"}${x(i)},${y(base[i] + vals[i])}L${x(i + 1)},${y(base[i] + vals[i])}`;
+    }
+    for (let i = n - 1; i >= 0; i--) bot += `L${x(i + 1)},${y(base[i])}L${x(i)},${y(base[i])}`;
+    return top + bot + "Z";
+  };
+  const zero = new Array(n).fill(0);
+  const grid = [];
+  const yStep = yMax > 10 ? 5 : 2;
+  for (let v = 0; v <= yMax; v += yStep) grid.push(`<line x1="${L}" x2="${W - R}" y1="${y(v)}" y2="${y(v)}" stroke="var(--grid)" stroke-width="1"/>
+    <text x="${L - 6}" y="${y(v) + 4}" text-anchor="end" class="axis">${v}</text>`);
+  const xStep = span > 240 ? 60 : span > 90 ? 30 : 10;
+  for (let s = 0; s <= span; s += xStep) grid.push(`<text x="${x(s)}" y="${H - 6}" text-anchor="middle" class="axis">${mmss(s)}</text>`);
+  const kills = (run.kills || []).map(k => {
+    const i = k.killed_at - run.started_at;
+    return `<line x1="${x(i)}" x2="${x(i)}" y1="${T}" y2="${T + ih}" stroke="var(--ink)" stroke-width="1.5"/>`;
+  }).join("");
+  svg.innerHTML = `${grid.join("")}
+    <line x1="${L}" x2="${W - R}" y1="${y(maxWorkers)}" y2="${y(maxWorkers)}" stroke="var(--muted)" stroke-width="1"/>
+    <text x="${W - R}" y="${y(maxWorkers) - 4}" text-anchor="end" class="axis">limit ${maxWorkers}</text>
+    <path d="${step(tl.rebooking, zero)}" fill="var(--pool-1)"/>
+    <path d="${step(tl.rerouting, tl.rebooking)}" fill="var(--pool-2)" stroke="var(--bg)" stroke-width="2" paint-order="stroke"/>
+    ${kills}
+    <line id="xhair" y1="${T}" y2="${T + ih}" stroke="var(--ink)" stroke-width="1" visibility="hidden"/>
+    <rect id="hit" x="${L}" y="${T}" width="${iw}" height="${ih}" fill="transparent"/>`;
+  const hit = svg.querySelector("#hit"), xh = svg.querySelector("#xhair"), tip = $("tip");
+  const show = (clientX) => {
+    const box = svg.getBoundingClientRect();
+    const px = (clientX - box.left) * (W / box.width);
+    const i = Math.min(n - 1, Math.max(0, Math.floor(((px - L) / iw) * span)));
+    xh.setAttribute("x1", x(i + 0.5)); xh.setAttribute("x2", x(i + 0.5)); xh.setAttribute("visibility", "visible");
+    const killedHere = (run.kills || []).filter(k => Math.floor(k.killed_at - run.started_at) === i);
+    tip.innerHTML = `At ${mmss(i)}: <b>${tl.total[i]}</b> busy<br>First pass <b>${tl.rebooking[i]}</b>, re-route <b>${tl.rerouting[i]}</b>` +
+      (killedHere.length ? `<br>Killed ${killedHere.map(k => esc(k.worker)).join(", ")}` : "");
+    tip.hidden = false;
+    tip.style.left = `${(x(i + 0.5) / W) * box.width}px`;
+    tip.style.top = `${(T / H) * box.height}px`;
+  };
+  hit.onmousemove = (e) => show(e.clientX);
+  hit.ontouchstart = (e) => show(e.touches[0].clientX);
+  hit.onmouseleave = () => { tip.hidden = true; xh.setAttribute("visibility", "hidden"); };
+}
+window.addEventListener("resize", () => data && renderChart(data.latest_run, data.worker_mappings));
+
+// --- tables --------------------------------------------------------------------
 function renderPasses(run) {
   const p = run ? run.stats.passes_to_close : {};
   const max = Math.max(1, ...Object.values(p));
@@ -230,27 +359,32 @@ function renderPasses(run) {
     : `<p class="empty-note">Appears as records close.</p>`;
 }
 
-function renderWorkers(run) {
-  const ws = run ? run.workers : [];
-  $("workers-t").innerHTML = ws.length ? `<tr><th>Worker</th><th>State</th><th class="n">Done</th><th class="n">Took over</th><th class="n">Fenced</th><th>Last seen</th></tr>` +
-    ws.map(w => `<tr><td>${esc(w.worker_id)}</td><td class="ws ${esc(w.status)}">${esc(w.status)}${w.kill_plan ? `<div class="offers">kill planned ${esc(w.kill_plan)}</div>` : ""}</td>
-      <td class="n">${w.completed}</td><td class="n">${w.takeovers}</td><td class="n">${w.fenced}</td>
-      <td>${ago(data.generated_at - w.heartbeat_at)} ago</td></tr>`).join("")
-    : `<tr><td class="empty-note">Workers appear when a run starts.</td></tr>`;
+function renderQueues(q, maps) {
+  const label = { rebooking: "Rebooking (pass 1)", rerouting: "Re-routing (pass 2+)", dead_letter: "Dead letter" };
+  $("queues-t").innerHTML = `<tr><th>Queue</th><th class="n">Waiting</th><th class="n">In flight</th><th>Workers</th></tr>` +
+    Object.entries(q || {}).map(([k, v]) => {
+      const m = (maps || {})[k];
+      const w = m ? `${m.state === "Enabled" ? "on" : esc(m.state).toLowerCase()}, up to ${m.max_workers}` : "–";
+      return `<tr><td>${label[k] || k}</td><td class="n">${v.visible}</td><td class="n">${v.in_flight}</td><td>${w}</td></tr>`;
+    }).join("");
 }
 
-function renderQueues(q) {
-  $("queues-t").innerHTML = `<tr><th>Queue</th><th class="n">Waiting</th><th class="n">In flight</th></tr>` +
-    Object.entries(q || {}).map(([k, v]) => `<tr><td>${k.replace("_", " ")}</td><td class="n">${v.visible}</td><td class="n">${v.in_flight}</td></tr>`).join("");
+function renderWorkers(run) {
+  const ws = run ? run.workers : [];
+  $("workers-t").innerHTML = ws.length ? `<tr><th>Worker</th><th>State</th><th>Queues</th><th class="n">Passes handled</th><th class="n">Took over</th><th class="n">First seen</th><th class="n">Last seen</th></tr>` +
+    ws.map(w => `<tr><td>${esc(w.worker_id)}</td><td class="ws ${esc(w.state)}">${esc(w.state)}</td>
+      <td>${w.pools.map(p => p === "rebooking" ? "first pass" : "re-route").join(", ")}</td>
+      <td class="n">${w.passes}</td><td class="n">${w.takeovers}</td><td class="n">${mmss(w.first_seen_s)}</td><td class="n">${mmss(w.last_seen_s)}</td></tr>`).join("")
+    : `<tr><td class="empty-note">Workers appear when the queue scales them up.</td></tr>`;
 }
 
 function renderRuns(runs) {
-  $("runs-t").innerHTML = runs.length ? `<tr><th>Run</th><th>Started</th><th>State</th><th class="n">Workers</th><th class="n">Reject %</th><th class="n">Killed</th>
-      <th class="n">Accepted</th><th class="n">In golden set</th><th class="n">To a person</th><th class="n">Avg passes</th><th class="n">Took</th></tr>` +
+  $("runs-t").innerHTML = runs.length ? `<tr><th>Run</th><th>Started</th><th>State</th><th class="n">Reject %</th><th class="n">Killed</th>
+      <th class="n">Peak workers</th><th class="n">Accepted</th><th class="n">In golden set</th><th class="n">To a person</th><th class="n">Avg passes</th><th class="n">Took</th></tr>` +
     runs.map(r => { const f = r.final || {}; return `<tr><td>${esc(r.run_id)}</td><td>${when(r.started_at)}</td><td>${esc(r.status)}</td>
-      <td class="n">${r.workers}</td><td class="n">${r.reject_percent}</td><td class="n">${r.kill_workers}</td>
+      <td class="n">${r.reject_percent}</td><td class="n">${f.kills_fired ?? r.kill_workers}</td><td class="n">${f.workers_peak ?? "–"}</td>
       <td class="n">${f.resolved ?? "–"}</td><td class="n">${f.satisfactory ?? "–"}</td><td class="n">${f.human_review ?? "–"}</td>
-      <td class="n">${f.avg_passes ?? "–"}</td><td class="n">${f.duration_s != null ? ago(f.duration_s) : "–"}</td></tr>`; }).join("")
+      <td class="n">${f.avg_passes ?? "–"}</td><td class="n">${f.duration_s != null ? clock(f.duration_s) : "–"}</td></tr>`; }).join("")
     : `<tr><td class="empty-note">No runs yet.</td></tr>`;
 }
 
@@ -267,16 +401,19 @@ function renderRecords(run) {
 async function refresh() {
   clearTimeout(timer);
   try {
+    const sent = Date.now();
     const r = await fetch("/results", { cache: "no-store" });
     data = await r.json();
     if (!r.ok) throw new Error(data.error || r.statusText);
+    clockOffset = data.generated_at * 1000 - (sent + Date.now()) / 2;   // server clock vs this browser
     const run = data.latest_run;
-    renderBoard(run, data.records_in_table); renderRunbox(run); renderPasses(run);
-    renderWorkers(run); renderQueues(data.queues); renderRuns(data.recent_runs || []); renderRecords(run); renderDetail();
+    renderBoard(run, data.records_in_table); renderRunbox(run, data.worker_mappings);
+    renderChart(run, data.worker_mappings); renderPasses(run); renderQueues(data.queues, data.worker_mappings);
+    renderWorkers(run); renderRuns(data.recent_runs || []); renderRecords(run); renderDetail(); tick();
     if (!run && !busy) say(data.records_in_table ? `${data.records_in_table} records loaded. Start a run.` : "No records loaded. Load records to begin.");
   } catch (e) { say(`Couldn't read results: ${e.message}`, true); }
-  const live = data && data.latest_run && ["starting", "running", "stalled"].includes(data.latest_run.status);
-  timer = setTimeout(refresh, live ? 2500 : 10000);
+  const live = data && data.latest_run && ACTIVE.includes(data.latest_run.status);
+  timer = setTimeout(refresh, live ? 2000 : 10000);
 }
 refresh();
 </script>
