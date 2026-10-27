@@ -819,20 +819,20 @@ def test_throttled_start_invocations_are_adopted(env):
         ev = json.loads(Payload)
         if ev.get("internal") != "start_run":
             return real(FunctionName=FunctionName, InvocationType=InvocationType, Payload=Payload)
-        delay = 20 if first.is_set() else 0     # Lambda retrying throttled async invokes; one gets through
+        delay = 60 if first.is_set() else 0     # Lambda retrying throttled async invokes; one gets through
         first.set()
 
         def later():
             all_admitted.wait(10)               # the three clients all start at once
             time.sleep(delay)
             real(FunctionName=FunctionName, InvocationType=InvocationType, Payload=Payload)
-        threading.Thread(target=later, daemon=True).start()
+        threading.Thread(target=later, daemon=True, name="late-start").start()
         return {"StatusCode": 202}
     handler.lam.invoke = throttled
     ids = [start(handler, kind="integration", reject_percent=0, client_token=str(uuid.uuid4())) for _ in range(3)]
     all_admitted.set()
     time.sleep(0.2)
-    end = time.time() + 15
+    end = time.time() + 45                      # set-ups run one after another, each paced on WCU
     while time.time() < end and any(handler.get_meta(r, consistent=True)["status"] == "starting" for r in ids):
         time.sleep(0.2)
     metas = [handler.get_meta(r, consistent=True) for r in ids]
@@ -841,7 +841,8 @@ def test_throttled_start_invocations_are_adopted(env):
         res = wait_complete(handler, r, timeout=150)["latest_run"]
         assert res["stats"]["closed"] == res["stats"]["records"]
         assert not res["stats"]["races"]["double_commits"]
-    time.sleep(21)                              # the late invocations arrive and find nothing to do
+    while any(t.is_alive() for t in threading.enumerate() if t.name.startswith("late-start")):
+        time.sleep(1)                           # the late invocations arrive and find nothing to do
     for r in ids:
         ev = handler.query_all(KeyConditionExpression="pk = :p AND sk = :s",
                                ExpressionAttributeValues=common.to_ddb({":p": common.run_pk(r), ":s": "EVENTS"}))

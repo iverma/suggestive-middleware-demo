@@ -28,6 +28,7 @@ UI / API (Lambda URL) ──► experiment-control ──► SQS rebooking ─�
 | **Per-run partitions** (`RUN#<id>`) and fair queues (`MessageGroupId = run`) | Runs reading or writing each other's records, and one big run starving the others. |
 | **Admission control**: at most 6 active runs and 1,300 records, shared by chaos, integration and load runs | Too much work admitted for the provisioned capacity. |
 | **Conditional status transitions** | Cancel racing finish, two finishers, or stale clients changing a finished run. |
+| **Run set-up adoption** | Throttled start invocations. Workers can hold 8 of the account's 10 Lambdas, so with several simultaneous starts some start invocations wait minutes for Lambda's retries. Set-up is claimed per run, and the first control invocation that runs sets up every waiting run, one after another within the write budget. This was found by the live five-client check. |
 
 ## Scalability
 
@@ -35,7 +36,7 @@ UI / API (Lambda URL) ──► experiment-control ──► SQS rebooking ─�
 |---|---|
 | **Workers autoscale from queue depth** (SQS event source mappings, 5 rebooking + 3 rerouting) | Capped below the account's 10-execution Lambda limit so the control functions can always run. |
 | **Paced writers** | Run setup, golden loads and the load producer each stay under a write-unit budget, so the provisioned 25 WCU / 25 RCU (free tier) are never exceeded. |
-| **Load producer with backpressure** | Releases at most 2 records/s and holds back while the backlog is above a cap. It hands off to a fresh invocation every chunk, so a run can outlast one Lambda's 15-minute limit. A producer that dies is restarted from its cursor. |
+| **Load producer with backpressure** | Releases at most 2 records/s and holds back while the backlog is above a cap. SQS depth is approximate, so the cap holds to within one 10-record block. It hands off to a fresh invocation every chunk, so a run can outlast one Lambda's 15-minute limit. A producer that dies is restarted from its cursor. |
 | **Load runs never read their records per poll** | The UI and API read counters only. A paced finalizer scores the run once. |
 | **TTL (24h) on all run data** | Storage stays flat no matter how many runs are made. |
 
