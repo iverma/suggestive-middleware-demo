@@ -6,9 +6,8 @@ name: Live check
 on:
   workflow_dispatch:
     inputs:
-      workers: { description: "Workers", default: "4" }
       reject_percent: { description: "Reject %", default: "50" }
-      kill_workers: { description: "Workers to kill", default: "2" }
+      kill_workers: { description: "Workers to kill", default: "3" }
   push:
     branches: [main]
     paths:
@@ -34,4 +33,4 @@ jobs:
       - name: Run with killed workers and verify nothing is lost
         run: >
           python3 scripts/live_check.py "$DEMO_URL"
-          "${{ inputs.workers || '4' }}" "${{ inputs.reject_percent || '50' }}" "${{ inputs.kill_workers || '2' }}"
+          "${{ inputs.reject_percent || '50' }}" "${{ inputs.kill_workers || '3' }}"
