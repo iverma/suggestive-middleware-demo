@@ -1,7 +1,7 @@
 name: Inspect
 
 # Read-only: prints the state of the latest runs as annotations (Actions logs can be hard to
-# reach). Run by hand, or push a change to this file.
+# reach from outside). Run by hand, or push a change to this file.
 on:
   workflow_dispatch:
     inputs:
