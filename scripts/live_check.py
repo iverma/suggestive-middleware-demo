@@ -22,13 +22,15 @@ def call(base, method, path):
         return json.loads(r.read())
 
 
-def main(base, reject="50", kill_percent="10", slow_percent="0", dup_percent="0", timeout_s=900):
+def main(base, reject="50", kill_percent="10", slow_percent="0", dup_percent="0", poison_percent="0",
+         throttle_percent="0", timeout_s=900):
     before = call(base, "GET", "/results")
     if before["records_in_table"] == 0:
         print("no records loaded; loading the golden set first")
         print(call(base, "POST", "/load"))
     run = call(base, "POST", f"/run?reject_percent={reject}&kill_percent={kill_percent}"
-                             f"&slow_percent={slow_percent}&dup_percent={dup_percent}")
+                             f"&slow_percent={slow_percent}&dup_percent={dup_percent}"
+                             f"&poison_percent={poison_percent}&throttle_percent={throttle_percent}")
     print("started", run)
     end = time.time() + timeout_s
     while time.time() < end:
@@ -64,6 +66,12 @@ def main(base, reject="50", kill_percent="10", slow_percent="0", dup_percent="0"
           f"{r['duplicates_dropped']} dropped); {r['zombies']} zombies ({r['zombies_fenced']} fenced, "
           f"{r['zombies_uncontested']} uncontested); {s['events']['fenced']} late writes fenced in all; "
           f"records with two results for one pass: {r['double_commits']}")
+    d = s["degradation"]
+    print(f"::notice title=Degraded dependencies::{d['throttles_injected']} AWS calls throttled (HTTP 400), "
+          f"{d['sdk_retries']} SDK retries, {d['throttled_after_retries']} still throttled after retries "
+          f"({d['message_backoffs']} message backoffs), {d['own_writes_recognized']} own writes recognized, "
+          f"{d['poison_failures']} poison deliveries, {d['dead_lettered_swept']} records dead-lettered and swept "
+          f"to a person, {d['other_errors']} other errors caught")
     unrecovered = [k for k in res["latest_run"]["kills"] if not k["recovered"]]
     for k in unrecovered:
         print("::warning::not recovered:", json.dumps(k))
@@ -78,6 +86,7 @@ def main(base, reject="50", kill_percent="10", slow_percent="0", dup_percent="0"
     ok = (res["latest_run"]["status"] == "complete" and s["open"] == 0 and s["records"] == 100
           and not unrecovered and (s["kills_fired"] > 0 or float(kill_percent) == 0)
           and r["double_commits"] == 0 and r["zombies_fenced"] + r["zombies_uncontested"] == r["zombies"]
+          and res["queues"]["dead_letter"]["visible"] == 0
           and all(v in ("Disabled", "Disabling") for v in maps.values()))
     if not ok:
         print(f"::error::run not clean: status={res['latest_run']['status']} open={s['open']} "
