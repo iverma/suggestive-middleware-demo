@@ -762,12 +762,17 @@ def test_load_run_backpressure_and_handoff(env, monkeypatch):
     assert s["passed"], s
     assert s["records"] == s["created"] == s["closed"] == 80 and s["lost"] == 0
     assert s["double_results"] == 0 and s["outside_rules"] == 0
-    assert s["max_backlog"] <= 10 + handler.LOAD_BLOCK and s["create_skipped"] == 0
+    assert s["max_release_depth"] <= 10 and s["create_skipped"] == 0
     assert s["backpressure_s"] > 0                              # the producer was held back
     assert s["handoffs"] >= 1                                    # the release outlived one chunk
     ids = {r["case_id"] for r in case_items(common, run_id)}
     assert len(ids) == 80 and all(i.startswith("LOAD-") for i in ids)
-    assert run["records"] == [] and run["stats"]["released"] == 80    # the view never reads records
+    assert run["stats"]["released"] == 80
+    # The final view comes from the finalizer's snapshot: full sections, notable records first.
+    assert run["records_total"] == 80 and 0 < len(run["records"]) <= handler.SNAPSHOT_RECORDS
+    assert run["timeline"] and max(run["timeline"]["rebooking"]) >= 1 and run["workers"]
+    assert run["stats"]["passes_to_close"] and run["stats"]["closed"] == 80
+    assert all(r["satisfactory"] or r["status"] == "human_review" for r in run["records"])
 
 
 def test_load_producer_dies_and_is_restarted(env, monkeypatch):
@@ -879,3 +884,23 @@ def test_dead_letter_is_left_to_the_sweeper_not_requeued(env, monkeypatch):
     finally:
         stop.set()
     assert {w["case_id"] for w in res["latest_run"]["sweeps"]} == poisoned
+
+
+def test_load_run_view_refreshes_while_running(env, monkeypatch):
+    """Viewers of a running load run see workers over time and the sections below it."""
+    handler, common, *_ = env
+    monkeypatch.setattr(handler, "SNAPSHOT_S", 1)
+    monkeypatch.setattr(handler, "LOAD_RECORDS_PER_SEC", 10.0)
+    run_id = start(handler, kind="load", records=60, backlog_cap=50, chunk_s=60, rate=10)
+    end, seen = time.time() + 60, None
+    while time.time() < end:
+        _, res = http(handler, "GET", "/results", run=run_id)
+        run = res["latest_run"]
+        if run.get("snapshot_at") and run["status"] in ("running", "starting"):
+            seen = run
+            break
+        time.sleep(0.3)
+    assert seen, "no snapshot while the run was going"
+    assert seen["timeline"] and seen["stats"]["records"] == 60 and "races" in seen["stats"]
+    assert seen["stats"]["closed"] <= 60 and seen["records_total"] <= 60
+    wait_summary(handler, run_id)

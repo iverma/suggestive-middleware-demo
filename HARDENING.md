@@ -16,6 +16,24 @@ UI / API (Lambda URL) ──► experiment-control ──► SQS rebooking ─�
                    CloudWatch: 10 alarms → SNS email
 ```
 
+## Multi-tenancy
+
+Every run is a tenant. Chaos, integration and load runs, from any number of browser tabs or
+clients, share one deployment: the same queues, workers, Lambda concurrency and DynamoDB
+capacity. Each tenant still gets its own data, settings and results.
+
+| Guarantee | How |
+|---|---|
+| **Own data** | Each run copies the records into its own partition (`RUN#<id>`) and works only there. Runs never read or overwrite each other's records, and a finished run's data can't be changed by a later one. |
+| **Own settings** | Rejection, crash, slow, duplicate, poison and throttle settings travel on each run's own messages, so one run's faults never apply to another. |
+| **Fair share of workers** | Messages carry the run id as their group (SQS fair queues), so a big tenant (a 1,000-record load test) can't starve a small one. |
+| **Shared budget** | Admission control caps active runs (6) and records (1,300) across all tenants. Requests over the cap get a 429. The budget is released when a run finishes, fails or is cancelled. |
+| **Scoped actions** | Cancel stops only its own run. A repeated start with the same client token returns the first run, and a stale client gets a 409 for a run that already finished. |
+| **Scoped recovery** | The sweeper, orphan re-queue and lost-handoff repair write only into the partition of the run that owns the record. |
+| **Visible in the UI** | The multi-tenancy panel shows each active run as a tenant: its settings, progress, share of the record budget and closing rate, next to the shared meters. |
+
+How it's tested: the mocked suite covers 20 simultaneous starts, budget limits, cancel isolation, double submit and cancelled-run message drops. The live split-brain check runs five clients at once (see the latest live results).
+
 ## Concurrency
 
 | Feature | What it protects against |
@@ -37,7 +55,7 @@ UI / API (Lambda URL) ──► experiment-control ──► SQS rebooking ─�
 | **Workers autoscale from queue depth** (SQS event source mappings, 5 rebooking + 3 rerouting) | Capped below the account's 10-execution Lambda limit so the control functions can always run. |
 | **Paced writers** | Run setup, golden loads and the load producer each stay under a write-unit budget, so the provisioned 25 WCU / 25 RCU (free tier) are never exceeded. |
 | **Load producer with backpressure** | Releases at most 2 records/s and holds back while the backlog is above a cap. SQS depth is approximate, so the cap holds to within one 10-record block. It hands off to a fresh invocation every chunk, so a run can outlast one Lambda's 15-minute limit. A producer that dies is restarted from its cursor. |
-| **Load runs never read their records per poll** | The UI and API read counters only. A paced finalizer scores the run once. |
+| **Load runs never read their records per poll** | Live counters come from the run's summary item. The full view (workers over time, incidents, crash and race tables, workers, the 200 most notable records) is rebuilt about once a minute by one paced background read and stored compressed (about 11 KB). Every viewer reads that one item, so the cost of viewing doesn't grow with the run's size or the number of viewers. |
 | **TTL (24h) on all run data** | Storage stays flat no matter how many runs are made. |
 
 ## Resiliency
@@ -50,7 +68,7 @@ UI / API (Lambda URL) ──► experiment-control ──► SQS rebooking ─�
 | **Lost-handoff repair and orphan re-queue** | A record whose next message never got sent, or disappeared. A record whose message is in the dead-letter queue is left to the sweeper, so poison is never quietly re-sent. That gap was found live. |
 | **Housekeeping** | Runs stuck starting, runs past their time limit, budget held by finished runs, dead load producers, worker mappings out of step. |
 | **Alarms (CloudWatch → email)** | Backlog, message age, DLQ depth, DynamoDB capacity and throttles, Lambda errors, and a stuck-run heartbeat. |
-| **Backups** | Point-in-time recovery is not enabled yet, because it isn't in the free tier (see later work). |
+| **Backups** | None in the demo. Point-in-time recovery isn't in the free tier (see production-level enhancements). |
 
 ## Testing
 
@@ -68,18 +86,19 @@ UI / API (Lambda URL) ──► experiment-control ──► SQS rebooking ─�
 - **Load run**: 1,000/1,000 closed in about 9 minutes. 0 lost, 0 double results, 0 outcomes outside the rules. Backpressure held the producer back for 24s, and the producer handed off 8 times. DynamoDB peaked at 14 WCU/s (the alarm threshold is 16), and no alarm fired.
 - **Split-brain (five clients)**: all five runs completed. The run cancelled mid-flight stopped. Poison was swept only within its own runs (5 and 11 records), with none in the runs without poison. A double submit started exactly one run, and a stale cancel got a 409. Every run had its records queued within 27s and closed its first record within 79s of queueing.
 
-## Later work
+## Production-level enhancements (not in the demo because they cost money)
 
-**Resiliency**
-- **Multi-region**: DynamoDB global tables plus SQS queues and workers in a second region, with failover. This is left out of the demo because replicated writes and cross-region traffic aren't free.
-- **Point-in-time recovery** on both tables (about $0.20/GB-month, under a cent for this data) and on-demand backups before schema changes.
-- **AWS Budgets alert** when monthly spend passes $1.
-- **Deploy during a run** (rolling Lambda versions with aliases). Judged low value for the demo.
+| Enhancement | Why it's needed in production | Rough cost |
+|---|---|---|
+| **Multi-region**: DynamoDB global tables, SQS queues and workers in a second region, with failover | A regional outage shouldn't stop re-booking | Replicated writes, a second stack, cross-region traffic |
+| **Point-in-time recovery** on both tables, plus on-demand backups before schema changes | Recovery from bad writes or deletes, to any second in the last 35 days | $0.20/GB-month (under a cent for this data) |
+| **On-demand or auto-scaled DynamoDB capacity** | The runs table's 20 WCU caps throughput at about 2 records/s (about 7 WCU per record), which is why 1,000 records take about 9 minutes | On-demand is billed per request |
+| **Higher Lambda concurrency quota and reserved concurrency** for the control plane | The account's 10 concurrent executions are shared by workers and control functions; the start-adoption fix works around this | Quota increase, no direct charge |
+| **AWS Budgets alert** on monthly spend | Catch unexpected charges early | Little or none for a single spend budget |
+| **Deploy during a run**: Lambda versions and aliases with gradual rollout | Ship without pausing work in progress | Mostly no added cost |
 
-**Scalability**
-- On-demand or auto-scaled DynamoDB capacity, and a higher Lambda concurrency quota, to go past the free-tier ceilings. Throughput is currently bound by 20 WCU on the runs table, at about 7 WCU per record.
+## Later work (no added cost)
+
 - A load test where backpressure always engages, which needs workers slower than the release rate (a fault knob for load runs, or a lower worker cap).
-
-**Product**
 - Later resolution passes that use an agent reasoning over customer booking history, after the rules-engine first pass.
 - Idempotency keys on any real external side effect (customer notifications), since messages can be delivered more than once.

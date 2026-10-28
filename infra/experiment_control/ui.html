@@ -134,6 +134,18 @@
   .run-chip .meter { display: block; height: 4px; margin-top: 4px; background: var(--line); border-radius: 2px; overflow: hidden; }
   .run-chip .meter i { display: block; height: 100%; background: var(--resolved); }
   .run-chip .mine { color: var(--focus); font-weight: 700; }
+  .section-note { color: var(--muted); max-width: 72ch; margin: 4px 0 12px; }
+  .tenancy-meters { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; margin-bottom: 12px; }
+  .tmeter { border: 1px solid var(--line); border-radius: 4px; padding: 10px 12px; }
+  .tmeter .v { font-size: 1.3rem; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .tmeter .k { color: var(--muted); font-size: .85rem; }
+  .tmeter .bar { height: 6px; background: var(--line); border-radius: 3px; margin-top: 6px; overflow: hidden; display: flex; }
+  .tmeter .bar i { display: block; height: 100%; }
+  .guarantees { margin: 14px 0 0; padding-left: 18px; max-width: 80ch; }
+  .guarantees li { margin: 4px 0; }
+  .hero.load-view > div:first-child { display: none; }
+  .hero.load-view { grid-template-columns: minmax(0, 640px); }
+  .swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 6px; vertical-align: middle; }
   tr.viewing td { background: var(--panel); }
   #runs-t tr[data-run] { cursor: pointer; }
   .feed { list-style: none; margin: 0; padding: 0; max-height: 360px; overflow-y: auto; border-top: 1px solid var(--line); }
@@ -192,6 +204,21 @@
     <aside class="runbox" id="runbox"></aside>
   </div>
 
+  <section aria-labelledby="tenancy-h">
+    <h2 id="tenancy-h">Multi-tenancy: runs sharing this deployment</h2>
+    <p class="section-note">Every run is a tenant. Runs share the queues, the workers and the database capacity, but each run has its own copy of the records and its own settings. Admission control keeps the total inside the free-tier budget.</p>
+    <div class="tenancy-meters" id="tenancy-meters"></div>
+    <div class="scroll"><table id="tenancy-t"></table></div>
+    <ul class="guarantees">
+      <li><b>Own data:</b> each run works on its own copy of the records in its own partition (<code>RUN#&lt;id&gt;</code>), so runs never read or overwrite each other's records.</li>
+      <li><b>Fair share of workers:</b> each run's messages carry its run id as their group, so SQS fair queues stop a big run (a load test) from starving a small one.</li>
+      <li><b>Own settings:</b> rejection, crash, poison and throttle settings travel on each run's own messages and never apply to another run.</li>
+      <li><b>Shared budget:</b> at most a fixed number of runs and records are active at once, across chaos, integration and load runs. Requests over the limit get a clear 429.</li>
+      <li><b>Scoped actions:</b> a cancel stops only its own run. A repeated start with the same client token returns the first run, and a stale client can't change a finished run.</li>
+      <li><b>Scoped recovery:</b> the dead-letter sweeper and orphan re-queue write only into the run that owns the record.</li>
+    </ul>
+  </section>
+
   <section>
     <div class="chart-head">
       <h2>Workers over time</h2>
@@ -245,6 +272,7 @@
 
   <section>
     <h2>Records in the latest run</h2>
+    <p class="section-note" id="records-note"></p>
     <div class="scroll"><table id="records-t"></table></div>
   </section>
 </div>
@@ -321,6 +349,45 @@ function renderActive(d) {
       <span class="meter"><i style="width:${pct}%"></i></span></button>`;
   }).join("") || `<span class="empty-note">No runs in progress.</span>`;
   $("run-chips").querySelectorAll("button.run-chip").forEach(c => c.onclick = () => view(c.dataset.run));
+}
+
+// --- multi-tenancy -------------------------------------------------------------
+const TENANT_COLORS = ["var(--resolved)", "var(--inflight)", "var(--human)", "var(--focus)", "var(--queued)", "var(--ink)"];
+function knobText(r) {
+  const parts = [`${r.reject_percent ?? 0}% reject`];
+  [["kill_percent", "crash"], ["slow_percent", "slow"], ["dup_percent", "dup"], ["poison_percent", "poison"], ["throttle_percent", "throttle"]]
+    .forEach(([k, label]) => { if (r[k]) parts.push(`${r[k]}% ${label}`); });
+  return parts.join(", ");
+}
+function renderTenancy(d) {
+  const b = d.budget || {}, runs = d.active_runs || [], maps = d.worker_mappings || {};
+  const maxWorkers = Object.values(maps).reduce((a, m) => a + m.max_workers, 0);
+  const q = d.queues || {};
+  const busy = ["rebooking", "rerouting"].reduce((a, k) => a + ((q[k] || {}).in_flight || 0), 0);
+  const share = (r) => b.max_records ? 100 * (r.records || 0) / b.max_records : 0;
+  const segs = runs.map((r, i) => `<i style="width:${share(r)}%;background:${TENANT_COLORS[i % TENANT_COLORS.length]}" title="${esc(r.run_id)}: ${r.records} records"></i>`).join("");
+  $("tenancy-meters").innerHTML = `
+    <div class="tmeter"><div class="v">${b.runs ?? 0} of ${b.max_runs ?? "–"}</div><div class="k">runs active (tenants)</div>
+      <div class="bar"><i style="width:${b.max_runs ? 100 * (b.runs || 0) / b.max_runs : 0}%;background:var(--ink)"></i></div></div>
+    <div class="tmeter"><div class="v">${b.records ?? 0} of ${b.max_records ?? "–"}</div><div class="k">records admitted, by run</div>
+      <div class="bar">${segs}</div></div>
+    <div class="tmeter"><div class="v">${busy}</div><div class="k">messages in flight across all runs (being worked, or waiting out a retry); up to ${maxWorkers} shared workers</div></div>`;
+  const nowS = (Date.now() + clockOffset) / 1000;
+  const recent = (d.recent_runs || []).filter(r => !runs.some(a => a.run_id === r.run_id)).slice(0, 4);
+  const rows = runs.map((r, i) => ({ ...r, color: TENANT_COLORS[i % TENANT_COLORS.length], active: true }))
+    .concat(recent.map(r => ({ ...r, closed: r.closed ?? (r.final || {}).closed, active: false })));
+  $("tenancy-t").innerHTML = rows.length ? `<tr><th>Run (tenant)</th><th>Kind</th><th>State</th><th>Its own settings</th><th class="n">Closed</th><th class="n">Budget share</th><th class="n">Records/min</th><th>Started</th></tr>` +
+    rows.map(r => {
+      const secs = Math.max(1, (r.finished_at || nowS) - r.started_at);
+      const rate = r.closed != null ? (60 * r.closed / secs).toFixed(1) : "–";
+      return `<tr data-run="${esc(r.run_id)}" class="${r.run_id === (d.latest_run && d.latest_run.run_id) ? "viewing" : ""}">
+        <td>${r.active ? `<i class="swatch" style="background:${r.color}"></i>` : ""}${mine.has(r.run_id) ? "<b>yours</b> " : ""}${esc(r.run_id)}</td>
+        <td>${esc(r.kind || "chaos")}</td><td>${esc(r.status)}</td><td class="offers">${esc(r.kind === "load" ? "generated records, no faults" : knobText(r))}</td>
+        <td class="n">${r.closed ?? "–"} of ${r.records ?? "–"}</td><td class="n">${r.active ? share(r).toFixed(0) + "%" : "released"}</td>
+        <td class="n">${rate}</td><td>${when(r.started_at)}</td></tr>`;
+    }).join("")
+    : `<tr><td class="empty-note">No runs yet.</td></tr>`;
+  $("tenancy-t").querySelectorAll("tr[data-run]").forEach(tr => tr.onclick = () => view(tr.dataset.run));
 }
 
 // --- live run clock ------------------------------------------------------------
@@ -574,7 +641,7 @@ function renderWorkers(run) {
 
 function loadLine(f) {
   return `${f.passed ? "PASSED" : "FAILED"}: ${f.closed} of ${f.records} closed, ${f.lost} lost, ${f.double_results} double results, ` +
-    `${f.outside_rules} outside the rules; ${f.peak_workers} peak workers; backlog peaked at ${f.max_backlog} (cap ${f.backlog_cap}); ` +
+    `${f.outside_rules} outside the rules; ${f.peak_workers} peak workers; released only into a backlog of at most ${f.max_release_depth ?? "–"} (cap ${f.backlog_cap}), held back ${f.backpressure_s}s; ` +
     `${f.handoffs} producer handoffs; took ${clock(f.duration_s)}.`;
 }
 function renderLoadbox(run) {
@@ -588,7 +655,8 @@ function renderLoadbox(run) {
       <dt>Released</dt><dd>${s.released} of ${s.records}</dd>
       <dt>Closed</dt><dd>${s.closed} (${s.resolved} accepted, ${s.human_review} to a person)</dd>
       <dt>Backlog now</dt><dd>${s.backlog_now}</dd>
-      <dt>Backlog peak</dt><dd>${s.max_backlog} of cap ${s.backlog_cap}</dd>
+      <dt>Released into</dt><dd>at most ${s.max_release_depth ?? 0} queued (cap ${s.backlog_cap})</dd>
+      <dt>Shared queue peak</dt><dd>${s.max_backlog} (all runs)</dd>
       <dt>Producer handoffs</dt><dd>${s.handoffs}</dd>
     </dl>
     <p class="empty-note" style="margin-top:10px">${f ? esc(loadLine(f)) : FINISHED_STATES.includes(run.status) ? "Scoring the run…" : `load run ${esc(run.run_id)}: generated unique records, no injected faults.`}${run.error ? ` (${esc(run.error)})` : ""}</p>`;
@@ -612,6 +680,8 @@ function renderRuns(runs) {
 
 function renderRecords(run) {
   const rs = run ? run.records : [];
+  $("records-note").textContent = run && run.records_total > rs.length
+    ? `Showing the ${rs.length} most notable of ${run.records_total} records (open, swept, retried or crashed first), as of ${clock(run.snapshot_at - run.started_at)}.` : "";
   $("records-t").innerHTML = rs.length ? `<tr><th>Case</th><th>State</th><th class="n">Passes</th><th>Outcome</th><th>Offers made</th><th class="n">Fencing token</th><th class="n">Claims</th></tr>` +
     rs.map(r => `<tr class="${r.case_id === selected ? "sel" : ""}"><td>${esc(r.case_id)}</td><td>${esc(r.status)}</td><td class="n">${r.pass_no}</td>
       <td>${esc(r.resolution || "")}${r.status === "resolved" && !r.satisfactory ? " (outside golden set)" : ""}</td>
@@ -631,12 +701,15 @@ async function refresh() {
     const run = data.latest_run;
     renderActive(data);
     $("btn-cancel").hidden = !(run && ACTIVE.includes(run.status));
+    renderTenancy(data);
     if (run && run.kind === "load") {
-      // A load run never ships its records: show its counters and, once scored, its one-line result.
-      renderBoard(null, 0); renderLoadbox(run); renderChart(null, data.worker_mappings); renderPasses(null);
-      renderQueues(data.queues, data.worker_mappings); renderWorkers(null); renderFeed(null); renderDegradation(null);
-      renderCrashes(null); renderRaces(null); renderRuns(data.recent_runs || []); renderRecords(null); $("detail").hidden = true; tick();
+      // A load run's sections come from a snapshot rebuilt about once a minute; counters are live.
+      const v = run.snapshot_at ? run : null;
+      document.querySelector(".hero").classList.add("load-view"); renderLoadbox(run); renderChart(v, data.worker_mappings); renderPasses(v);
+      renderQueues(data.queues, data.worker_mappings); renderWorkers(v); renderFeed(v); renderDegradation(v);
+      renderCrashes(v); renderRaces(v); renderRuns(data.recent_runs || []); renderRecords(v); renderDetail(); tick();
     } else {
+      document.querySelector(".hero").classList.remove("load-view");
       renderBoard(run, data.records_in_table); renderRunbox(run, data.worker_mappings);
       renderChart(run, data.worker_mappings); renderPasses(run); renderQueues(data.queues, data.worker_mappings);
       renderWorkers(run); renderFeed(run); renderDegradation(run); renderCrashes(run); renderRaces(run); renderRuns(data.recent_runs || []); renderRecords(run); renderDetail(); tick();
