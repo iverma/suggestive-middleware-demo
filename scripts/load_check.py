@@ -136,8 +136,9 @@ def main(base, records="1000", backlog_cap="10", chunk_s="60", timeout_s=2400):
         "none lost": summary["lost"] == 0 and summary["closed"] == records,
         "no double results": summary["double_results"] == 0,
         "no outcome outside the rules": summary["outside_rules"] == 0,
-        # SQS depth is approximate and lags: one block (10) of overshoot is within bounds.
-        "backlog stayed within its cap": summary["max_backlog"] <= summary["backlog_cap"] + 10,
+        # Checked at every release: the producer only released into a backlog within the cap.
+        # (The shared queue's peak also counts other runs and SQS's approximate depth.)
+        "released only within the backlog cap": summary["max_release_depth"] <= summary["backlog_cap"],
         f"producer handed off (>= {expect_handoffs})": summary["handoffs"] >= expect_handoffs,
         "run complete": lr["status"] == "complete",
     }
@@ -164,7 +165,8 @@ def main(base, records="1000", backlog_cap="10", chunk_s="60", timeout_s=2400):
 
     line = (f"{summary['closed']}/{records} closed, {summary['lost']} lost, {summary['double_results']} double, "
             f"{summary['outside_rules']} outside rules, peak workers {summary['peak_workers']}, backlog peak "
-            f"{summary['max_backlog']}/{summary['backlog_cap']} (held back {summary['backpressure_s']}s), {summary['handoffs']} handoffs, "
+            f"{summary['max_backlog']} (released into at most {summary['max_release_depth']} of cap {summary['backlog_cap']}, "
+            f"held back {summary['backpressure_s']}s), {summary['handoffs']} handoffs, "
             f"{summary['duration_s']}s; peak {seen.get('peak_wcu_per_s')} WCU/s, alarms fired {seen.get('alarms_fired')}")
     if failures:
         for f in failures:
