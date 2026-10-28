@@ -89,3 +89,15 @@ jobs:
               --start-time $(date -u -d '-24 hours' +%FT%TZ) --end-time $(date -u +%FT%TZ) --period 3600 --statistics Maximum \
               --query 'max(Datapoints[].Maximum)' --output text 2>&1)
           echo "::notice title=Lambda throttles (24h)::control function $T, worker $W, account peak concurrency $C"
+      - name: Recent housekeeping results from the control function's logs (read-only)
+        run: |
+          ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+          CREDS=$(aws sts assume-role --role-arn "arn:aws:iam::${ACCOUNT}:role/cdk-hnb659fds-lookup-role-${ACCOUNT}-${AWS_REGION}" \
+                  --role-session-name hk --query Credentials --output json)
+          export AWS_ACCESS_KEY_ID=$(echo "$CREDS" | jq -r .AccessKeyId)
+          export AWS_SECRET_ACCESS_KEY=$(echo "$CREDS" | jq -r .SecretAccessKey)
+          export AWS_SESSION_TOKEN=$(echo "$CREDS" | jq -r .SessionToken)
+          START=$(( ($(date +%s) - 1800) * 1000 ))
+          aws logs filter-log-events --log-group-name /aws/lambda/effect-demo-experiment-control --start-time $START \
+            --filter-pattern '?housekeeping ?budget_reconciled ?Traceback ?ERROR' --max-items 12 --query 'events[].message' --output json \
+            | python3 -c "import json,sys; [print('::notice title=Control log::' + m.strip()[:600]) for m in json.load(sys.stdin)[-8:]]"
