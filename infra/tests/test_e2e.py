@@ -847,3 +847,35 @@ def test_throttled_start_invocations_are_adopted(env):
         ev = handler.query_all(KeyConditionExpression="pk = :p AND sk = :s",
                                ExpressionAttributeValues=common.to_ddb({":p": common.run_pk(r), ":s": "EVENTS"}))
         assert not (ev and ev[0].get("duplicates_sent")), "a run was set up twice"
+
+
+def test_dead_letter_is_left_to_the_sweeper_not_requeued(env, monkeypatch):
+    """
+    Found live: a poison run whose other records finished early looked stalled, and the orphan
+    re-queue re-sent its poisoned records as plain messages before the sweeper ran, quietly
+    healing them. A record whose message is in the DLQ belongs to the sweeper.
+    """
+    handler, common, worker, esm, threads = env
+    monkeypatch.setattr(handler, "ORPHAN_S", 1)
+    monkeypatch.setattr(handler, "STALL_S", 1)
+    poisoned = {"IROPS-MSP-0007"}
+    common.poison_plan = lambda run_id, case_id, pass_no, pct=0: case_id in poisoned and pass_no == 1
+    http(handler, "POST", "/load")
+    run_id = start(handler, reject_percent=0, poison_percent=1)
+    end = time.time() + 240                     # no sweeper yet: the poison message reaches the DLQ
+    while time.time() < end:
+        _, res = http(handler, "GET", "/results", run=run_id)
+        if res["queues"]["dead_letter"]["visible"]:
+            break
+        time.sleep(0.5)
+    for _ in range(6):                          # viewers keep polling a run that looks stalled
+        _, res = http(handler, "GET", "/results", run=run_id)
+        time.sleep(0.5)
+    assert res["latest_run"]["stats"]["degradation"]["orphans_requeued"] == 0
+    stop = threading.Event()
+    threading.Thread(target=sweeper_ticks, args=(stop,), daemon=True).start()
+    try:
+        res = wait_complete(handler, run_id, timeout=60)
+    finally:
+        stop.set()
+    assert {w["case_id"] for w in res["latest_run"]["sweeps"]} == poisoned

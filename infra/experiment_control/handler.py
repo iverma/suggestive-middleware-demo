@@ -917,7 +917,10 @@ def run_detail(run_id, queues, t):
 
 def requeue_orphans(run_id, rows, queues, t):
     """Re-send the message for open records nothing can deliver any more. At most once a minute per run."""
-    empty = not any(q["visible"] + q["in_flight"] for name, q in queues.items() if name != "dead_letter")
+    # A dead letter still counts as "a message left": its record belongs to the sweeper, which
+    # sends it to a person. Re-sending it here would quietly heal a poison message instead
+    # (found live: a poison run whose other records finished early lost all its sweeps).
+    empty = not any(q["visible"] + q["in_flight"] for q in queues.values())
     limit = ORPHAN_S if empty else ORPHAN_BACKLOG_S
     orphans = []
     for r in rows:

@@ -47,7 +47,7 @@ UI / API (Lambda URL) ──► experiment-control ──► SQS rebooking ─�
 | **SQS redelivery + lease takeover** | A worker crashing at any of 8 points in its work. |
 | **Retries with backoff** (botocore standard mode; message-level backoff on throttles) | DynamoDB/SQS throttling and transient errors. |
 | **Dead-letter queue + sweeper** | Poison messages: after 5 deliveries the record goes to human review with a fenced write, in its own run's partition. |
-| **Lost-handoff repair and orphan re-queue** | A record whose next message never got sent, or disappeared. |
+| **Lost-handoff repair and orphan re-queue** | A record whose next message never got sent, or disappeared. A record whose message is in the dead-letter queue is left to the sweeper, so poison is never quietly re-sent. That gap was found live. |
 | **Housekeeping** | Runs stuck starting, runs past their time limit, budget held by finished runs, dead load producers, worker mappings out of step. |
 | **Alarms (CloudWatch → email)** | Backlog, message age, DLQ depth, DynamoDB capacity and throttles, Lambda errors, and a stuck-run heartbeat. |
 | **Backups** | Point-in-time recovery is not enabled yet, because it isn't in the free tier (see later work). |
@@ -61,6 +61,12 @@ UI / API (Lambda URL) ──► experiment-control ──► SQS rebooking ─�
 | **Live chaos check** | A real run with crashes, slow workers, duplicates, poison and throttles. Fails on any lost or open record. | `Live check` workflow |
 | **Live split-brain check** | Five clients at once with different settings, a mid-flight cancel, poison swept only in its own run, a double submit, a stale cancel, and budget released afterwards. | `Live check` workflow |
 | **Live load check** | 1,000 unique generated records. Checks for no loss, no double results, outcomes within the rules, backlog under its cap, producer handoffs, no alarm fired, DynamoDB under 80% of capacity and no throttles. | `Load check` workflow |
+
+## Latest live results (deployed stack, us-west-2)
+
+- **Chaos run**: 100/100 closed. 21 crashes at all 8 kill points recovered, 68 injected throttles absorbed by retries, 0 records with two results.
+- **Load run**: 1,000/1,000 closed in about 9 minutes. 0 lost, 0 double results, 0 outcomes outside the rules. Backpressure held the producer back for 24s, and the producer handed off 8 times. DynamoDB peaked at 14 WCU/s (the alarm threshold is 16), and no alarm fired.
+- **Split-brain (five clients)**: all five runs completed. The mid-flight cancel stopped its run, a double submit started exactly one run, and a stale cancel got a 409. After the start-adoption fix every run had its records queued within 28s. Re-running after the dead-letter fix.
 
 ## Later work
 
