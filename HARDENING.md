@@ -66,7 +66,7 @@ UI / API (Lambda URL) ──► experiment-control ──► SQS rebooking ─�
 
 - **Chaos run**: 100/100 closed. 21 crashes at all 8 kill points recovered, 68 injected throttles absorbed by retries, 0 records with two results.
 - **Load run**: 1,000/1,000 closed in about 9 minutes. 0 lost, 0 double results, 0 outcomes outside the rules. Backpressure held the producer back for 24s, and the producer handed off 8 times. DynamoDB peaked at 14 WCU/s (the alarm threshold is 16), and no alarm fired.
-- **Split-brain (five clients)**: all five runs completed. The mid-flight cancel stopped its run, a double submit started exactly one run, and a stale cancel got a 409. After the start-adoption fix every run had its records queued within 28s. Re-running after the dead-letter fix.
+- **Split-brain (five clients)**: all five runs completed. The run cancelled mid-flight stopped. Poison was swept only within its own runs (5 and 11 records), with none in the runs without poison. A double submit started exactly one run, and a stale cancel got a 409. Every run had its records queued within 27s and closed its first record within 79s of queueing.
 
 ## Later work
 
