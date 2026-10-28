@@ -1,0 +1,27 @@
+name: Agent compare
+
+# Live rules-vs-agent comparison (Claude Haiku on Bedrock for reroutes). Not free: about
+# 5-10 cents of model calls per 1,000-record agent run. Run by hand only.
+on:
+  workflow_dispatch:
+    inputs:
+      records: { description: "Records per arm", default: "1000" }
+
+permissions:
+  contents: read
+
+concurrency:
+  group: live-check
+  cancel-in-progress: false
+
+env:
+  DEMO_URL: https://htd5qtuasvlslvzldh3bsragui0jdkwr.lambda-url.us-west-2.on.aws/
+
+jobs:
+  compare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Agent arm, then rules arm, same customers
+        run: python3 scripts/agent_compare.py "$DEMO_URL" "${{ inputs.records || '1000' }}"

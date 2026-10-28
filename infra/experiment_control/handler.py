@@ -36,6 +36,7 @@ import urllib.request
 from datetime import datetime, timezone
 from decimal import Decimal
 
+import agent
 import generator
 from analysis import (
     EVENT_COUNTERS, attribute_kills, incidents, kills_by_point, normalize_kill, race_results, score,
@@ -46,7 +47,7 @@ from common import (
     ACTIVE, ADMISSION_KEY, DLQ, ESMS, FINISHED, INDEX_PK, KEY, LEASE_SECONDS, RECORD_BUDGET,
     MAX_ACTIVE_RUNS, NUMERIC, RECORDS_TABLE, REBOOKING_QUEUE, REROUTING_QUEUE, RUN_KINDS, RUNS_TABLE, TERMINAL,
     VISIBILITY_SECONDS, WcuPacer, cancellation, case_key, plain_body, transact, consumed, ddb, dumps, from_ddb, golden,
-    input_rows, knobs, lam, meta_key, now, outgoing, pace_rate, run_pk, scan_all, sqs, to_ddb, ttl_for,
+    input_rows, knobs, lam, meta_key, now, offer_sequence, outgoing, pace_rate, run_pk, scan_all, sqs, to_ddb, ttl_for,
 )
 
 MAX_KILL_PERCENT = 50     # every message crashing once doubles a run's work; keep runs sane
@@ -77,6 +78,7 @@ LOAD_RECORDS_PER_SEC = float(os.environ.get("LOAD_RECORDS_PER_SEC", "2.0"))
 LOAD_BACKLOG_CAP = int(os.environ.get("LOAD_BACKLOG_CAP", "500"))
 LOAD_CHUNK_S = int(os.environ.get("LOAD_CHUNK_S", "540"))
 LOAD_BLOCK = 10                 # records created and enqueued per step (one SendMessageBatch)
+PREFERENCE_RECORDS_PER_SEC = 1.4  # customers with a preference take ~2-2.6 passes/record: keep writes < 80%
 PRODUCER_STALE_S = 120          # no producer heartbeat for this long: housekeeping restarts it
 FINALIZE_READ_PER_SEC = 8.0     # read units/s spent scoring a finished load run
 SNAPSHOT_READ_PER_SEC = 4.0     # read units/s spent refreshing a running load run's view
@@ -353,6 +355,12 @@ def start_run(params):
           "dup_percent": _int_param(params, "dup_percent", 0, 0, MAX_DUP_PERCENT),
           "poison_percent": _int_param(params, "poison_percent", 0, 0, MAX_POISON_PERCENT),
           "throttle_percent": _int_param(params, "throttle_percent", 0, 0, MAX_THROTTLE_PERCENT)}
+    agent_on = _int_param(params, "agent", 0, 0, 1)
+    customer = params.get("customer", "random")
+    if customer not in ("random", "preference"):
+        raise HttpError(400, "customer must be random or preference")
+    if customer == "preference" and kind != "load":
+        raise HttpError(400, "customers with a preference come with generated load records (kind=load)")
     load_fields = {}
     if kind == "load":
         # A clean throughput run: generated unique records, no injected faults.
@@ -365,6 +373,9 @@ def start_run(params):
             "backlog_cap": _int_param(params, "backlog_cap", LOAD_BACKLOG_CAP, LOAD_BLOCK, LOAD_BACKLOG_CAP),
             "chunk_s": _int_param(params, "chunk_s", LOAD_CHUNK_S, 1, LOAD_CHUNK_S),
             "rate": min(float(params.get("rate") or LOAD_RECORDS_PER_SEC), LOAD_RECORDS_PER_SEC)}
+        if customer == "preference":
+            # Picky customers take more passes, so more writes per record: release them slower.
+            load_fields["rate"] = min(load_fields["rate"], PREFERENCE_RECORDS_PER_SEC)
     else:
         records = golden_count()
         if not records:
@@ -376,7 +387,7 @@ def start_run(params):
     max_workers = sum(e["max"] for e in ESMS.values())
     common_fields = {"run_id": run_id, "kind": kind, "status": "starting", "started_at": round(t, 3),
                      "reject_percent": reject, **kn, "records": records, "max_workers": max_workers,
-                     "ttl": ttl_for(t)}
+                     "agent": agent_on, "customer": customer, "ttl": ttl_for(t)}
     meta = {**meta_key(run_id), **common_fields, **load_fields, "index_sk": index_sk, "closed": 0, "resolved": 0,
             "human_review": 0, "passes_total": 0, "closed_by_pass": {}, "last_progress_at": round(t, 3)}
     index = {"pk": INDEX_PK, "sk": index_sk, **common_fields}
@@ -398,6 +409,7 @@ def start_run(params):
         finish(run_id, "failed", error=f"could not start the run: {type(e).__name__}")
         raise HttpError(503, "could not start the run; it was rolled back, try again")
     return {"run_id": run_id, "kind": kind, "status": "starting", "reject_percent": reject, **kn, **load_fields,
+            "agent": agent_on, "customer": customer,
             "records": records, "workers": f"autoscaled by SQS, up to {max_workers}, shared by all runs"}
 
 
@@ -565,6 +577,7 @@ def produce(run_id):
 
 def _drive(run_id, meta, snaps, n, rate, cap, seed, t_start, deadline, columns, kn, cursor,
            t0, released, max_seen, last_beat, waited, max_release):
+    prefer = meta.get("customer") == "preference"
     while cursor < n and now() < deadline:
         depth = backlog()
         max_seen = max(max_seen, depth)
@@ -585,6 +598,10 @@ def _drive(run_id, meta, snaps, n, rate, cap, seed, t_start, deadline, columns, 
             item = {**generator.make_inputs(i, seed, columns), **case_key(run_id, case_id), KEY: case_id,
                     "run_id": run_id, "status": "queued", "pass_no": 1, "queued_at": round(now(), 3),
                     "history": [], "claims": 0, "fencing_token": 0, "ttl": ttl_for(t_start)}
+            if prefer:
+                # Hidden preference (only the simulated customer reads it) and the note from
+                # their earlier call (the only hint the agent gets).
+                item["pref"], item["customer_note"] = generator.preference(i, seed, offer_sequence(item))
             try:
                 ddb.put_item(TableName=RUNS_TABLE, Item=to_ddb(item), ConditionExpression="attribute_not_exists(pk)")
             except ddb.exceptions.ConditionalCheckFailedException:
@@ -770,6 +787,20 @@ def finalize_load(run_id):
     # messages and SQS's approximate, lagging counts. What the producer controls, and what is
     # checked, is that it only ever released a block into a backlog that stayed within the cap.
     summary["max_release_depth"] = int(meta.get("max_release_depth", 0))
+    # Agent comparison: how fast each record closed and what the model calls cost.
+    calls_h = [h for r in rows for h in r.get("history", []) if "tk" in h]
+    spans = sorted(float(r["history"][-1]["t"]) - float(r["history"][0]["c"]) for r in rows if r.get("history"))
+    rerouted = [r for r in rows if len(r.get("history", [])) >= 2]
+    calls = len(calls_h)                        # committed passes that called the model
+    t_in, t_out = sum(int(h["tk"][0]) for h in calls_h), sum(int(h["tk"][1]) for h in calls_h)
+    summary.update({
+        "agent": int(meta.get("agent", 0)), "customer": meta.get("customer", "random"),
+        "avg_close_s": round(sum(spans) / max(1, len(spans)), 1),
+        "p90_close_s": round(spans[int(0.9 * (len(spans) - 1))], 1) if spans else 0,
+        "closed_first_reroute": sum(1 for r in rerouted if len(r["history"]) == 2 and r.get("status") == "resolved"),
+        "rerouted": len(rerouted),
+        "agent_calls": calls, "agent_fallbacks": sum(1 for h in calls_h if h.get("fb")),
+        "agent_tokens_in": t_in, "agent_tokens_out": t_out, "agent_cost_usd": agent.cost(t_in, t_out)})
     summary["passed"] = (summary["lost"] == 0 and double == 0 and outside == 0 and len(rows) == summary["records"]
                          and summary["max_release_depth"] <= summary["backlog_cap"])
     for key in (meta_key(run_id), {"pk": INDEX_PK, "sk": meta["index_sk"]}):
@@ -900,7 +931,7 @@ def query_all(**kw):
 
 def progress(meta):
     keep = ("run_id", "kind", "status", "started_at", "records", "closed", "resolved", "human_review",
-            "reject_percent", "last_progress_at", "finished_at", "error") + tuple(knobs({}).keys())
+            "reject_percent", "last_progress_at", "finished_at", "error", "agent", "customer") + tuple(knobs({}).keys())
     return {k: meta.get(k) for k in keep}
 
 
@@ -1001,7 +1032,7 @@ def build_detail(meta, items, t, gold):
             "urgency": r.get("urgency"), "cabin": r.get("cabin"), "destination": r.get("destination"),
             "party_size": r.get("party_size"), "travel_concerns": r.get("travel_concerns"),
             "queued_at": r.get("queued_at"), "resolved_at": r.get("resolved_at"), "swept": bool(r.get("swept")),
-            "history": [{k: h.get(k) for k in ("p", "o", "r", "w", "c", "t", "from")} for h in hist],
+            "history": [{k: h.get(k) for k in ("p", "o", "r", "w", "c", "t", "from", "why", "fb")} for h in hist],
             "crashes_here": sum(1 for k in kills if k["case_id"] == r[KEY]),
         })
     open_rows = [r for r in rows if r.get("status") not in TERMINAL]

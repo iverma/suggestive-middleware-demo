@@ -23,7 +23,7 @@ ROOT = Path(__file__).resolve().parents[2]
 CSV = ROOT / "golden_set" / "golden_set_irops_msp.csv"
 SRC = ROOT / "infra" / "experiment_control"
 BUILD = ROOT / "infra" / ".build" / "experiment_control"
-RUNTIME_FILES = ["common.py", "handler.py", "analysis.py", "worker.py", "sweeper.py", "throttle.py", "generator.py", "ui.html"]
+RUNTIME_FILES = ["common.py", "handler.py", "analysis.py", "worker.py", "sweeper.py", "throttle.py", "generator.py", "agent.py", "ui.html"]
 
 # Free tier: 25 provisioned RCU + 25 provisioned WCU per account, across ALL tables.
 # Provisioned capacity is what's billed, so these numbers ARE the cost ceiling: no
@@ -70,6 +70,7 @@ VISIBILITY_SECONDS = 20
 # Autoscaling ceiling, per queue. The account's Lambda concurrency limit is 10 (new-account
 # default) and is shared by every function, so workers get 8 and the UI/API keeps 2.
 # After a quota increase, raise these: e.g. 20 and 10.
+AGENT_MODEL_ID = "global.anthropic.claude-haiku-5-5"   # cheapest Claude on Bedrock ($0.10/$0.50 per M tokens)
 LAMBDA_ACCOUNT_CONCURRENCY = 10   # this account's quota (see the AWS limits workflow)
 REBOOKING_MAX_WORKERS = 5
 REROUTING_MAX_WORKERS = 3
@@ -162,7 +163,18 @@ class CustomerRecordsStack(Stack):
 
         worker = fn("Worker", WORKER_FN, "worker.handler", Duration.seconds(WORKER_TIMEOUT_S),
                     "Re-booking worker: invoked by SQS, claims records with fencing tokens",
-                    {**env, "ROLE": "worker"})
+                    {**env, "ROLE": "worker", "AGENT_MODEL_ID": AGENT_MODEL_ID})
+        # Reroute agent (runs started with agent=1): one Claude Haiku call per reroute pass, via the
+        # global cross-region inference profile. Not free tier: about $0.00006 a call.
+        worker.add_to_role_policy(iam.PolicyStatement(
+            actions=["bedrock:InvokeModel"],
+            resources=[f"arn:{self.partition}:bedrock:{self.region}:{self.account}:inference-profile/{AGENT_MODEL_ID}",
+                       f"arn:{self.partition}:bedrock:*::foundation-model/{AGENT_MODEL_ID.split('.', 1)[1]}",
+                       f"arn:{self.partition}:bedrock:::foundation-model/{AGENT_MODEL_ID.split('.', 1)[1]}"]))
+        # A model's first call in an account subscribes to it through AWS Marketplace (no charge
+        # for the subscription itself; usage is billed per token).
+        worker.add_to_role_policy(iam.PolicyStatement(
+            actions=["aws-marketplace:ViewSubscriptions", "aws-marketplace:Subscribe"], resources=["*"]))
 
         # Lambda autoscales the workers from queue depth, one message per invoke. Created switched
         # OFF: an enabled mapping long-polls its queue around the clock (~650k SQS requests/month

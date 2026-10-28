@@ -86,6 +86,16 @@ How it's tested: the mocked suite covers 20 simultaneous starts, budget limits, 
 - **Load run**: 1,000/1,000 closed in about 9 minutes, with the full view refreshing about once a minute. 0 lost, 0 double results, 0 outcomes outside the rules. The producer only released into a backlog within its cap (10), was held back 20s, and handed off 8 times. DynamoDB peaked at 14.7 WCU/s (the alarm threshold is 16), and no alarm fired.
 - **Split-brain (five clients)**: all five runs completed. The run cancelled mid-flight stopped. Poison was swept only within its own runs (5 and 11 records), with none in the runs without poison. A double submit started exactly one run, and a stale cancel got a 409. Every run had its records queued within 27s and closed its first record within 79s of queueing.
 
+## Reroute agent (Claude Haiku on Bedrock)
+
+On reroute passes (pass 2 and later), runs started with `agent=1` ask Claude Haiku 5.5 on Amazon Bedrock which offer to make next. The model sees the customer's record, a note from their earlier call, and the offers they already turned down. It picks from the offers still allowed and gives a one-line reason, which is shown in each record's detail. The first offer always comes from the rules engine.
+
+- **Same safety rules as the rest of the system.** The pick must be one of the allowed offers. An error, a timeout (about 6s), throttling or an invalid pick falls back to the rules order for that pass and is counted. A slow or unavailable model never stalls a record, and the pass still commits under its fencing token.
+- **No extra writes.** Token counts ride on the pass's history entry, and run totals are summed when the run is scored.
+- **Comparison in the UI.** "Load test: rules" and "Load test: agent" run the same 1,000 generated customers. Each customer accepts only one offer, and about 70% hinted at it in their note. The panel compares average passes, the share closed on the first reroute, the human-review rate, time to close, model calls, fallbacks and cost. The customers, notes and preferences are synthetic.
+- **Cost:** about 400 input and 40 output tokens per call at $0.10 / $0.50 per million tokens, so about $0.00006 a call and roughly 5–10 cents per 1,000-record agent run. This is the only part of the demo outside the free tier.
+- **Production version:** customer history from the customer DB, DynamoDB vector search over past cases with similar concerns (on-demand table), a per-customer A/B split, and a golden-set eval of the model's picks.
+
 ## Production-level enhancements (not in the demo because they cost money)
 
 | Enhancement | Why it's needed in production | Rough cost |
@@ -100,5 +110,4 @@ How it's tested: the mocked suite covers 20 simultaneous starts, budget limits, 
 ## Later work (no added cost)
 
 - A load test where backpressure always engages, which needs workers slower than the release rate (a fault knob for load runs, or a lower worker cap).
-- Later resolution passes that use an agent reasoning over customer booking history, after the rules-engine first pass.
 - Idempotency keys on any real external side effect (customer notifications), since messages can be delivered more than once.

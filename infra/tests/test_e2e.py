@@ -904,3 +904,50 @@ def test_load_run_view_refreshes_while_running(env, monkeypatch):
     assert seen["timeline"] and seen["stats"]["records"] == 60 and "races" in seen["stats"]
     assert seen["stats"]["closed"] <= 60 and seen["records_total"] <= 60
     wait_summary(handler, run_id)
+
+
+# --- reroute agent (Bedrock is faked: the test checks the plumbing, not the model) ------------
+def fake_model(generator):
+    """Reads the customer's note the way a model would: a hinted note names their preference."""
+    def recommend(record, rejected, allowed):
+        note = record.get("customer_note", "")
+        for offer, phrases in generator.HINTS.items():
+            if note in phrases and offer in allowed:
+                return offer, f"the customer said: {note[:40]}", {"in": 400, "out": 40, "error": None}
+        return allowed[0], "no clear signal, next in order", {"in": 400, "out": 40, "error": None}
+    return recommend
+
+
+def test_agent_reroutes_close_preference_customers_in_fewer_passes(env, monkeypatch):
+    handler, common, worker, *_ = env
+    import generator
+    monkeypatch.setattr(handler, "LOAD_RECORDS_PER_SEC", 40.0)
+    monkeypatch.setattr(handler, "PREFERENCE_RECORDS_PER_SEC", 40.0)
+    monkeypatch.setattr(worker.agent, "recommend", fake_model(generator))
+    rules = start(handler, kind="load", records=80, customer="preference", agent=0, rate=40, client_token=str(uuid.uuid4()))
+    s_rules = wait_summary(handler, rules)["summary"]
+    agent_run = start(handler, kind="load", records=80, customer="preference", agent=1, rate=40,
+                      client_token=str(uuid.uuid4()))
+    run = wait_summary(handler, agent_run)
+    s_agent = run["summary"]
+    assert s_rules["passed"] and s_agent["passed"], (s_rules, s_agent)
+    assert s_rules["agent_calls"] == 0 and s_agent["agent_calls"] > 0 and s_agent["agent_fallbacks"] == 0
+    assert s_agent["avg_passes"] < s_rules["avg_passes"], (s_agent["avg_passes"], s_rules["avg_passes"])
+    assert s_agent["agent_cost_usd"] > 0
+    whys = [h.get("why") for r in run["records"] for h in r["history"] if h.get("why")]
+    assert whys and all(w.startswith("agent:") for w in whys)
+    rows = case_items(common, agent_run)
+    assert all(r.get("customer_note") for r in rows)
+    assert s_agent["closed_first_reroute"] > s_rules["closed_first_reroute"]
+
+
+def test_agent_failure_falls_back_to_rules_order(env, monkeypatch):
+    handler, common, worker, *_ = env
+    monkeypatch.setattr(handler, "LOAD_RECORDS_PER_SEC", 40.0)
+    monkeypatch.setattr(handler, "PREFERENCE_RECORDS_PER_SEC", 40.0)
+    monkeypatch.setattr(worker.agent, "recommend",
+                        lambda record, rejected, allowed: (None, "", {"in": 0, "out": 0, "error": "AccessDenied: no access"}))
+    run_id = start(handler, kind="load", records=40, customer="preference", agent=1, rate=40)
+    s = wait_summary(handler, run_id)["summary"]
+    assert s["passed"] and s["closed"] == 40
+    assert s["agent_calls"] == s["agent_fallbacks"] > 0

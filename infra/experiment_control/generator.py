@@ -265,3 +265,46 @@ def make_inputs(i, seed=LOAD_SEED, columns=None):
     keep = columns or [k for k in r if k not in ("acceptable_resolutions", "unacceptable_resolutions",
                                                   "acceptability_notes")]
     return {k: r[k] for k in keep if k in r and r[k] != ""}
+
+
+# --- Customers with a hidden preference (agent comparison runs) ---------------
+# Each customer will accept exactly one offer and reject the others. Most of them said
+# something about it on an earlier call; the note is stored on their record, the preference is
+# not shown to anyone deciding offers (rules engine or model).
+HINTS = {
+    "REBOOK_SAME_ROUTE": ["I really want to stay on my original routing, even if it means waiting a bit longer.",
+                          "Please keep me on the same route, I have lounge access and checked bags through."],
+    "REBOOK_ALTERNATE_AIRPORT": ["Landing at a nearby airport is fine, my sister can pick me up from either one.",
+                                 "Any airport in the area works for me, I have a rental car anyway."],
+    "REBOOK_PARTNER_AIRLINE": ["I don't care which airline it is, I just need to get there today.",
+                               "Put me on any carrier, my loyalty status doesn't matter for this trip."],
+    "REBOOK_ALTERNATE_ROUTE": ["Extra connections don't bother me, I'd rather keep moving than sit here.",
+                               "Route me through wherever, I'm fine with a couple of stops."],
+    "ALTERNATE_GROUND_TRANSPORT": ["Honestly I'd take a bus or a car service if it gets me there sooner.",
+                                   "I can drive or take a shuttle, it isn't that far."],
+    "SPLIT_PARTY_REBOOK": ["We don't need to sit together or even fly together, whoever can go first should go.",
+                           "Splitting our group across flights is totally fine with us."],
+    "CABIN_DOWNGRADE_WITH_FARE_DIFF_REFUND": ["I'll sit anywhere on the plane, just refund the difference.",
+                                              "Economy is fine for me today if I get the fare difference back."],
+    "TRAVEL_CREDIT": ["I can travel another weekend, keep the value for a future trip.",
+                      "No rush on my side, I'd take credit and rebook myself later."],
+    "FULL_REFUND": ["At this point I just want my money back and I'll make other plans.",
+                    "Cancel it and refund me, I'm not traveling anymore."],
+}
+VAGUE = ["Please help, this whole day has been really stressful.",
+         "I've been on hold for an hour, just tell me what you can do.",
+         "This is the second cancellation this month, I'm frustrated."]
+HINT_SHARE = 0.7
+
+
+def preference(i, seed, offers):
+    """(preferred offer, customer note) for load record i, given its rules-engine offers."""
+    real = [o for o in offers if o != "HUMAN_REVIEW"]
+    r = random.Random(f"{seed}:{i}:pref")
+    if not real or offers[0] == "HUMAN_REVIEW":
+        return None, r.choice(VAGUE)            # goes straight to a person either way
+    # The rules engine's first choice already works for many customers; these are the ones
+    # it ranks wrong (anything but its first choice), which is where reading the note pays off.
+    pref = r.choice(real[1:] if len(real) > 1 else real)
+    note = r.choice(HINTS[pref]) if r.random() < HINT_SHARE and pref in HINTS else r.choice(VAGUE)
+    return pref, note

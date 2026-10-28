@@ -173,7 +173,8 @@
       <label>Throttle % <input type="number" id="throttle" min="0" max="30" value="0"></label>
       <button type="submit" class="primary" id="btn-run">Start run</button>
       <button type="button" id="btn-cancel" hidden>Cancel this run</button>
-      <button type="button" id="btn-loadtest" title="1,000 generated unique records, no injected faults, released at a paced rate under a backlog cap">Load test (1,000)</button>
+      <button type="button" id="btn-load-rules" title="1,000 generated customers who each want one particular offer; reroutes walk the rules engine's order">Load test: rules</button>
+      <button type="button" id="btn-load-agent" title="Same 1,000 customers; each reroute asks Claude Haiku on Bedrock which offer to make next (about 5-10 cents a run)">Load test: agent</button>
       <button type="button" id="btn-load">Load records</button>
       <button type="button" id="btn-reset">Reset everything</button>
     </form>
@@ -217,6 +218,12 @@
       <li><b>Scoped actions:</b> a cancel stops only its own run. A repeated start with the same client token returns the first run, and a stale client can't change a finished run.</li>
       <li><b>Scoped recovery:</b> the dead-letter sweeper and orphan re-queue write only into the run that owns the record.</li>
     </ul>
+  </section>
+
+  <section aria-labelledby="ab-h">
+    <h2 id="ab-h">Rules vs agent: rerouting with a live model</h2>
+    <p class="section-note">Both load tests use the same 1,000 generated customers. Each customer will only accept one particular offer, and most of them hinted at it on an earlier call (a note on their record). On every reroute the rules arm makes the next offer in the rules engine's fixed order. The agent arm asks Claude Haiku on Bedrock to pick the next offer from what's left, using the record, the note and what was already turned down. The first offer always comes from the rules engine. The note and the hidden preference are synthetic, made for this demo.</p>
+    <div class="scroll"><table id="ab-t"></table></div>
   </section>
 
   <section>
@@ -334,7 +341,10 @@ $("controls").addEventListener("submit", (e) => {
   call(`/run?${q}`, "Starting run");
 });
 $("btn-load").onclick = () => call("/load", "Loading records");
-$("btn-loadtest").onclick = () => call(`/run?${new URLSearchParams({ kind: "load", records: 1000, client_token: crypto.randomUUID() })}`, "Starting load test");
+const loadTest = (agent) => call(`/run?${new URLSearchParams({ kind: "load", records: 1000, customer: "preference", agent,
+  client_token: crypto.randomUUID() })}`, agent ? "Starting agent load test" : "Starting rules load test");
+$("btn-load-rules").onclick = () => loadTest(0);
+$("btn-load-agent").onclick = () => loadTest(1);
 $("btn-cancel").onclick = () => { if (viewing && confirm(`Cancel ${viewing}? Other runs are not affected.`)) call(`/cancel?run=${encodeURIComponent(viewing)}`, "Cancelling"); };
 $("btn-reset").onclick = () => { if (confirm("Cancel EVERY run for everyone, empty the queues and delete all run data? Customer records are kept.")) call("/reset?confirm=everything", "Resetting everything"); };
 
@@ -382,12 +392,36 @@ function renderTenancy(d) {
       const rate = r.closed != null ? (60 * r.closed / secs).toFixed(1) : "–";
       return `<tr data-run="${esc(r.run_id)}" class="${r.run_id === (d.latest_run && d.latest_run.run_id) ? "viewing" : ""}">
         <td>${r.active ? `<i class="swatch" style="background:${r.color}"></i>` : ""}${mine.has(r.run_id) ? "<b>yours</b> " : ""}${esc(r.run_id)}</td>
-        <td>${esc(r.kind || "chaos")}</td><td>${esc(r.status)}</td><td class="offers">${esc(r.kind === "load" ? "generated records, no faults" : knobText(r))}</td>
+        <td>${esc(r.kind || "chaos")}</td><td>${esc(r.status)}</td><td class="offers">${esc(r.kind === "load" ? (r.customer === "preference" ? `picky customers, ${Number(r.agent) ? "agent" : "rules"} reroutes` : "generated records, no faults") : knobText(r))}</td>
         <td class="n">${r.closed ?? "–"} of ${r.records ?? "–"}</td><td class="n">${r.active ? share(r).toFixed(0) + "%" : "released"}</td>
         <td class="n">${rate}</td><td>${when(r.started_at)}</td></tr>`;
     }).join("")
     : `<tr><td class="empty-note">No runs yet.</td></tr>`;
   $("tenancy-t").querySelectorAll("tr[data-run]").forEach(tr => tr.onclick = () => view(tr.dataset.run));
+}
+
+// --- rules vs agent -------------------------------------------------------------
+function renderAB(d) {
+  const done = (d.recent_runs || []).filter(r => r.kind === "load" && r.final && r.final.customer === "preference");
+  const arm = (a) => done.find(r => Number(r.final.agent) === a);
+  const rules = arm(0), agent = arm(1);
+  if (!rules && !agent) { $("ab-t").innerHTML = `<tr><td class="empty-note">Run "Load test: rules" and "Load test: agent" to compare them here.</td></tr>`; return; }
+  const pct = (n, of) => of ? `${Math.round(100 * n / of)}%` : "–";
+  const rows = [
+    ["Records closed", f => `${f.closed} of ${f.records}`],
+    ["Average passes per record", f => f.avg_passes],
+    ["Closed on the first reroute", f => `${pct(f.closed_first_reroute, f.rerouted)} of rerouted (${f.closed_first_reroute} of ${f.rerouted})`],
+    ["Sent to a person", f => pct(f.human_review, f.closed)],
+    ["Average time to close a record", f => `${f.avg_close_s}s (p90 ${f.p90_close_s}s)`],
+    ["Model calls (fallbacks)", f => f.agent_calls ? `${f.agent_calls} (${f.agent_fallbacks})` : "none"],
+    ["Model tokens in / out", f => f.agent_calls ? `${f.agent_tokens_in.toLocaleString()} / ${f.agent_tokens_out.toLocaleString()}` : "–"],
+    ["Estimated model cost", f => f.agent_calls ? `$${f.agent_cost_usd.toFixed(3)}` : "$0"],
+    ["Whole run took", f => clock(f.duration_s)],
+  ];
+  const cell = (r, fn) => r ? esc(String(fn(r.final))) : "not run yet";
+  $("ab-t").innerHTML = `<tr><th></th><th>Rules${rules ? ` <span class="offers">${esc(rules.run_id.slice(-6))}</span>` : ""}</th>
+      <th>Agent (Claude Haiku)${agent ? ` <span class="offers">${esc(agent.run_id.slice(-6))}</span>` : ""}</th></tr>` +
+    rows.map(([label, fn]) => `<tr><td>${label}</td><td>${cell(rules, fn)}</td><td>${cell(agent, fn)}</td></tr>`).join("");
 }
 
 // --- live run clock ------------------------------------------------------------
@@ -426,7 +460,7 @@ function renderDetail() {
   (r.history || []).forEach(h => {
     if (h.w === "sweeper") { steps.push([h.c, `Pass ${h.p}: dead-lettered; the sweeper sent it to human review`]); return; }
     steps.push([h.c, `Pass ${h.p}: ${esc(h.w)} claimed it${h.from ? ` (took over from ${esc(h.from)})` : ""}`]);
-    steps.push([h.t, `Pass ${h.p}: offered ${esc(h.o)}, customer ${h.r === "reject" ? "rejected it" : h.r === "accept" ? "accepted" : "sent to a person"}`]);
+    steps.push([h.t, `Pass ${h.p}: offered ${esc(h.o)}${h.why ? ` <span class="offers">(${esc(h.why)})</span>` : ""}, customer ${h.r === "reject" ? "rejected it" : h.r === "accept" ? "accepted" : "sent to a person"}`]);
   });
   (run.kills || []).filter(k => k.case_id === r.case_id).forEach(k =>
     steps.push([k.killed_at, `Pass ${k.pass}: ${esc(k.worker)} ${k.mode === "timeout" ? "hung past its timeout" : k.mode === "raise" ? "threw" : "crashed"} at ${esc(POINT_LABEL[k.point] || k.point)}`]));
@@ -648,7 +682,7 @@ function renderLoadbox(run) {
   const s = run.stats, f = run.summary;
   const pct = s.records ? Math.round(100 * s.closed / s.records) : 0;
   $("runbox").innerHTML = `
-    <h2>${mine.has(run.run_id) ? "Your load test" : "Load test"} <span class="runstate ${esc(run.status)}">${esc(run.status)}</span></h2>
+    <h2>${mine.has(run.run_id) ? "Your load test" : "Load test"}${run.customer === "preference" ? (Number(run.agent) ? ": agent" : ": rules") : ""} <span class="runstate ${esc(run.status)}">${esc(run.status)}</span></h2>
     <div class="clock" id="run-clock" aria-label="Processing time">${clock(elapsed(run))}</div>
     <p class="clock-note">${pct}% closed. Records are released at up to ${run.rate}/s and never while the backlog would pass ${s.backlog_cap}.</p>
     <dl>
@@ -701,7 +735,7 @@ async function refresh() {
     const run = data.latest_run;
     renderActive(data);
     $("btn-cancel").hidden = !(run && ACTIVE.includes(run.status));
-    renderTenancy(data);
+    renderTenancy(data); renderAB(data);
     if (run && run.kind === "load") {
       // A load run's sections come from a snapshot rebuilt about once a minute; counters are live.
       const v = run.snapshot_at ? run : null;

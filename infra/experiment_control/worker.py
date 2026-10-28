@@ -60,11 +60,12 @@ import random
 import time
 import uuid
 
+import agent
 import throttle
 from common import (
     ACTIVE, RUN_TTL_S, cancellation, case_key, close_counters, is_throttle, meta_key, run_pk, transact,
-    LEASE_SECONDS, REBOOKING_QUEUE, REROUTING_QUEUE, RUNS_TABLE, TERMINAL,
-    VISIBILITY_SECONDS, customer_rejects, ddb, from_ddb, knobs, now, offer_sequence, outgoing, sqs, to_ddb,
+    KEY, LEASE_SECONDS, REBOOKING_QUEUE, REROUTING_QUEUE, RUNS_TABLE, TERMINAL,
+    VISIBILITY_SECONDS, customer_rejects, ddb, dumps, from_ddb, knobs, now, offer_sequence, outgoing, sqs, to_ddb,
 )
 
 WORK_MIN_S = float(os.environ.get("WORK_MIN_S", "0.6"))
@@ -324,6 +325,9 @@ def process(record, reject_percent=None, context=None):
     simulate_work(OFFER_SHARE / 2)
     offers = offer_sequence(old)
     offer = offers[pass_no - 1] if pass_no <= len(offers) else "HUMAN_REVIEW"
+    why = None
+    if ctl.get("agent") and pass_no >= 2 and offers[0] != "HUMAN_REVIEW":
+        offer, why = agent_pick(run_id, old, offers)
     if offer == "HUMAN_REVIEW":
         outcome = "human_review"
     else:
@@ -334,7 +338,10 @@ def process(record, reject_percent=None, context=None):
         simulate_work((1 - OFFER_SHARE) / 2)
         crash.at_point("during_customer_response")                          # K4
         simulate_work((1 - OFFER_SHARE) / 2)
-        outcome = "reject" if customer_rejects(run_id, case_id, pass_no, reject_percent) else "accept"
+        if ctl.get("customer") == "preference" and old.get("pref"):
+            outcome = "accept" if offer == old["pref"] else "reject"      # one offer works for them
+        else:
+            outcome = "reject" if customer_rejects(run_id, case_id, pass_no, reject_percent) else "accept"
     # A human-review pass has no customer step; a plan for K4 fires at the same place as K5.
     crash.at_point("during_customer_response", fire_as="before_commit")
     crash.at_point("before_commit")                                         # K5
@@ -351,6 +358,8 @@ def process(record, reject_percent=None, context=None):
     entry = {"p": pass_no, "o": offer, "r": outcome, "w": env_id(), "f": token, "c": round(t, 3), "t": round(now(), 3)}
     if takeover:
         entry["from"] = old.get("lease_owner")
+    if why:
+        entry.update(why)
     values = {":tok": token, ":w": env_id(), ":h": [entry], ":t": round(now(), 3), ":offer": offer}
     if outcome == "reject":
         update = ("SET #st = :queued, pass_no = :next, queued_at = :t, history = list_append(history, :h) "
@@ -410,6 +419,27 @@ def process(record, reject_percent=None, context=None):
         crash.at_point("after_commit_before_handoff", fire_as="after_final_commit_before_ack")
         crash.at_point("after_handoff_before_ack", fire_as="after_final_commit_before_ack")
     return True
+
+
+def agent_pick(run_id, rec, offers):
+    """
+    Reroute pass with the agent on: the model picks among the offers this customer hasn't
+    rejected yet. Falls back to the next offer in the rules order if the model fails.
+    Returns (offer, fields for the pass's history entry).
+    """
+    rejected = [h["o"] for h in rec.get("history", []) if h.get("r") == "reject"]
+    allowed = [o for o in offers if o != "HUMAN_REVIEW" and o not in rejected]
+    if not allowed:
+        return "HUMAN_REVIEW", {"why": "nothing left to offer"}
+    pick, why, usage = agent.recommend(rec, rejected, allowed)
+    # The call's tokens ride on the pass's history entry (no extra write); the run's totals are
+    # summed from the records when it finishes.
+    call = {"tk": [usage["in"], usage["out"]]}
+    if pick:
+        return pick, {**call, "why": f"agent: {why}"}
+    print(dumps({"worker": env_id(), "event": "agent_fallback", "run_id": run_id, "case_id": rec.get(KEY),
+                 "error": usage["error"]}))
+    return allowed[0], {**call, "fb": 1, "why": f"rules fallback ({usage['error'] or 'no pick'})"[:160]}
 
 
 def handle_unclaimable(record, run_id, case_id, pass_no, rec, t, kn=None):
