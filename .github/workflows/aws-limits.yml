@@ -101,3 +101,13 @@ jobs:
           aws logs filter-log-events --log-group-name /aws/lambda/effect-demo-experiment-control --start-time $START \
             --filter-pattern '?housekeeping ?budget_reconciled ?Traceback ?ERROR' --max-items 12 --query 'events[].message' --output json \
             | python3 -c "import json,sys; [print('::notice title=Control log::' + m.strip()[:600]) for m in json.load(sys.stdin)[-8:]]"
+      - name: Admission item (read-only)
+        run: |
+          ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+          CREDS=$(aws sts assume-role --role-arn "arn:aws:iam::${ACCOUNT}:role/cdk-hnb659fds-lookup-role-${ACCOUNT}-${AWS_REGION}" \
+                  --role-session-name adm --query Credentials --output json)
+          export AWS_ACCESS_KEY_ID=$(echo "$CREDS" | jq -r .AccessKeyId)
+          export AWS_SECRET_ACCESS_KEY=$(echo "$CREDS" | jq -r .SecretAccessKey)
+          export AWS_SESSION_TOKEN=$(echo "$CREDS" | jq -r .SessionToken)
+          I=$(aws dynamodb get-item --table-name experiment-runs --consistent-read --key '{"pk":{"S":"CONTROL"},"sk":{"S":"ADMISSION"}}' --output json 2>&1 | tr -d '\n ' | head -c 600)
+          echo "::notice title=Admission item::$I"
