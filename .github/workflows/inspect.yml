@@ -39,6 +39,9 @@ jobs:
               s = lr["stats"]
               if lr.get("kind") == "load":
                   print(f"::notice title={rid} load {lr['status']}::stats={s} summary={lr.get('summary')} error={lr.get('error')}")
+                  whys = [h.get("why") for r in lr.get("records", []) for h in r.get("history", []) if h.get("why")]
+                  for w in list(dict.fromkeys(whys))[:3]:
+                      print(f"::notice title={rid} agent::{w}")
                   continue
               print(f"::notice title={rid} {lr['status']}::closed={s['closed']}/{s['records']} counts={s['status_counts']} "
                     f"events={ {k: v for k, v in s['events'].items() if v} } degradation={ {k: v for k, v in s['degradation'].items() if v} } "
