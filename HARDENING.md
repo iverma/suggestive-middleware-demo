@@ -83,7 +83,7 @@ How it's tested: the mocked suite covers 20 simultaneous starts, budget limits, 
 ## Latest live results (deployed stack, us-west-2)
 
 - **Chaos run**: 100/100 closed. 21 crashes at all 8 kill points recovered, 68 injected throttles absorbed by retries, 0 records with two results.
-- **Load run**: 1,000/1,000 closed in about 9 minutes. 0 lost, 0 double results, 0 outcomes outside the rules. Backpressure held the producer back for 24s, and the producer handed off 8 times. DynamoDB peaked at 14 WCU/s (the alarm threshold is 16), and no alarm fired.
+- **Load run**: 1,000/1,000 closed in about 9 minutes, with the full view refreshing about once a minute. 0 lost, 0 double results, 0 outcomes outside the rules. The producer only released into a backlog within its cap (10), was held back 20s, and handed off 8 times. DynamoDB peaked at 14.7 WCU/s (the alarm threshold is 16), and no alarm fired.
 - **Split-brain (five clients)**: all five runs completed. The run cancelled mid-flight stopped. Poison was swept only within its own runs (5 and 11 records), with none in the runs without poison. A double submit started exactly one run, and a stale cancel got a 409. Every run had its records queued within 27s and closed its first record within 79s of queueing.
 
 ## Production-level enhancements (not in the demo because they cost money)
