@@ -94,6 +94,7 @@ On reroute passes (pass 2 and later), runs started with `agent=1` ask Claude Hai
 - **No extra writes.** Token counts ride on the pass's history entry, and run totals are summed when the run is scored.
 - **Comparison in the UI.** "Load test: rules" and "Load test: agent" run the same 1,000 generated customers. Each customer accepts only one offer, and about 70% hinted at it in their note. The panel compares average passes, the share closed on the first reroute, the human-review rate, time to close, model calls, fallbacks and cost. The customers, notes and preferences are synthetic.
 - **Cost:** about 400 input and 40 output tokens per call at $0.10 / $0.50 per million tokens, so about $0.00006 a call and roughly 5–10 cents per 1,000-record agent run. This is the only part of the demo outside the free tier.
+- **Live so far:** the first live comparison ran while Bedrock was still verifying the new account, so all 1,593 model calls were denied and fell back to the rules order. Both 1,000-record arms still closed every record, with 0 lost and 0 double results, which is the fallback path working as designed. The comparison will be re-run once model access is granted.
 - **Production version:** customer history from the customer DB, DynamoDB vector search over past cases with similar concerns (on-demand table), a per-customer A/B split, and a golden-set eval of the model's picks.
 
 ## Production-level enhancements (not in the demo because they cost money)
