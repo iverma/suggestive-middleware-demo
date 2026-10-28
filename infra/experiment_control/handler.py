@@ -1153,13 +1153,19 @@ def reconcile_budget():
                  if m and m.get("status") in ACTIVE)
     if actual == adm["records"]:
         return 0
+    values = {":n": actual, ":one": 1}
+    if adm["epoch"]:
+        cond, values[":e"] = "epoch = :e", adm["epoch"]
+    else:
+        cond = "attribute_not_exists(epoch)"
     try:
         ddb.update_item(TableName=RUNS_TABLE, Key=to_ddb(ADMISSION_KEY),
                         UpdateExpression="SET active_records = :n ADD epoch :one",
-                        ConditionExpression="epoch = :e OR (attribute_not_exists(epoch) AND :e = :zero)",
-                        ExpressionAttributeValues=to_ddb({":n": actual, ":e": adm["epoch"], ":one": 1, ":zero": 0}))
+                        ConditionExpression=cond, ExpressionAttributeValues=to_ddb(values))
     except ddb.exceptions.ConditionalCheckFailedException:
-        return 0                                # something changed meanwhile; the next tick checks again
+        print(dumps({"budget_reconcile": "skipped: admissions changed meanwhile", "counted": adm["records"],
+                     "actual": actual}))
+        return 0                                # the next tick checks again
     print(dumps({"budget_reconciled": {"was": adm["records"], "now": actual, "active": sorted(adm["active"])}}))
     return actual - adm["records"]
 
