@@ -198,8 +198,13 @@ def main(base, timeout_s=1200):
     print(f"set-up (records queued) at {queued}; slowest first close after queueing: {slowest:.1f}s")
     if slowest_setup > 60:
         failures.append(f"a concurrent run took {slowest_setup}s to queue its records (start invocations starved?)")
-    if slowest > 60:
+    # Five equal tenants share ~600 messages and 8 workers, so a run queued last waits behind
+    # the others' first messages (~4 messages/s): fair queues only favour a *quieter* tenant.
+    # Starvation would be an unbounded wait; 150s is ~1.5x the time to drain that backlog.
+    if slowest > 150:
         failures.append(f"a concurrent run waited {slowest:.1f}s after queueing for its first close (starved?)")
+    print(f"first close after queueing, per run: "
+          f"{ {n: round((first_progress.get(n) or 0) - (queued.get(n) or 0), 1) for n in RUNS} }")
 
     # 7. stale client cancels a finished run
     status, body = call(base, "POST", f"/cancel?run={ids['easy']}")
