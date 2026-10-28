@@ -78,7 +78,9 @@ LOAD_RECORDS_PER_SEC = float(os.environ.get("LOAD_RECORDS_PER_SEC", "2.0"))
 LOAD_BACKLOG_CAP = int(os.environ.get("LOAD_BACKLOG_CAP", "500"))
 LOAD_CHUNK_S = int(os.environ.get("LOAD_CHUNK_S", "540"))
 LOAD_BLOCK = 10                 # records created and enqueued per step (one SendMessageBatch)
-PREFERENCE_RECORDS_PER_SEC = 1.4  # customers with a preference take ~2-2.6 passes/record: keep writes < 80%
+# Customers with a preference take ~2.6 passes and 10-13 WCU per record (measured live), and the
+# rules and agent arms run side by side: 0.7 records/s each keeps the pair under 16 WCU/s (80%).
+PREFERENCE_RECORDS_PER_SEC = 0.7
 PRODUCER_STALE_S = 120          # no producer heartbeat for this long: housekeeping restarts it
 FINALIZE_READ_PER_SEC = 8.0     # read units/s spent scoring a finished load run
 SNAPSHOT_READ_PER_SEC = 4.0     # read units/s spent refreshing a running load run's view
@@ -183,8 +185,13 @@ def build_load_update(row):
             "ReturnConsumedCapacity": "TOTAL"}
 
 
-def load(wcu_per_sec=None):
+def load(wcu_per_sec=None, if_missing=False):
     """Upserts the customer records from the CSV. Safe while runs are active: runs work on copies."""
+    if if_missing:
+        _golden_count.clear()
+        have, want = golden_count(), sum(1 for _ in input_rows())
+        if have >= want:                        # every Run button calls /load first: usually a no-op
+            return {"loaded": 0, "already_loaded": have, "table": RECORDS_TABLE}
     rate = pace_rate(wcu_per_sec)
     pacer = WcuPacer(rate)
     n = 0
@@ -1210,7 +1217,7 @@ def route(event):
     if path == "/results" and method == "GET":
         return http_response(200, results(params.get("run")))
     mutating = {"/reset": lambda: reset_all(params),
-                "/load": lambda: load(params.get("wcu_per_sec")),
+                "/load": lambda: load(params.get("wcu_per_sec"), params.get("if_missing") in ("1", "true", True)),
                 "/run": lambda: start_run(params),
                 "/cancel": lambda: cancel(params)}
     if path in mutating:

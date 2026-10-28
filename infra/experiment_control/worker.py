@@ -320,13 +320,16 @@ def process(record, reject_percent=None, context=None):
     crash.at_point("after_claim")                                           # K2
 
     # --- decide (pass 1: rules engine; pass 2+: walk the rules ranking) -------
-    simulate_work(OFFER_SHARE / 2)
+    agent_pass = bool(ctl.get("agent")) and pass_no >= 2
+    if not agent_pass:                          # an agent pass spends this time on the real model call
+        simulate_work(OFFER_SHARE / 2)
     crash.at_point("during_offer")                                          # K3
-    simulate_work(OFFER_SHARE / 2)
+    if not agent_pass:
+        simulate_work(OFFER_SHARE / 2)
     offers = offer_sequence(old)
     offer = offers[pass_no - 1] if pass_no <= len(offers) else "HUMAN_REVIEW"
     why = None
-    if ctl.get("agent") and pass_no >= 2 and offers[0] != "HUMAN_REVIEW":
+    if agent_pass and offers[0] != "HUMAN_REVIEW":
         offer, why = agent_pick(run_id, old, offers)
     if offer == "HUMAN_REVIEW":
         outcome = "human_review"

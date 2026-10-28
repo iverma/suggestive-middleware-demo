@@ -52,7 +52,7 @@ How it's tested: the mocked suite covers 20 simultaneous starts, budget limits, 
 
 | Feature | Notes |
 |---|---|
-| **Workers autoscale from queue depth** (SQS event source mappings, 5 rebooking + 3 rerouting) | Capped below the account's 10-execution Lambda limit so the control functions can always run. |
+| **Workers autoscale from queue depth** (SQS event source mappings, 3 first-pass + 3 reroute) | Capped well below the account's 10 concurrent Lambdas, leaving room for load producers, the UI and the sweeper. With 8 workers, two side-by-side load runs used all 10, and the UI's requests were throttled ("Too Many Requests", found live). The UI now also waits and retries quietly on a 429. |
 | **Paced writers** | Run setup, golden loads and the load producer each stay under a write-unit budget, so the provisioned 25 WCU / 25 RCU (free tier) are never exceeded. |
 | **Load producer with backpressure** | Releases at most 2 records/s and holds back while the backlog is above a cap. SQS depth is approximate, so the cap holds to within one 10-record block. It hands off to a fresh invocation every chunk, so a run can outlast one Lambda's 15-minute limit. A producer that dies is restarted from its cursor. |
 | **Load runs never read their records per poll** | Live counters come from the run's summary item. The full view (workers over time, incidents, crash and race tables, workers, the 200 most notable records) is rebuilt about once a minute by one paced background read and stored compressed (about 11 KB). Every viewer reads that one item, so the cost of viewing doesn't grow with the run's size or the number of viewers. |
@@ -88,14 +88,7 @@ How it's tested: the mocked suite covers 20 simultaneous starts, budget limits, 
 
 ## Reroute agent (Claude Haiku on Bedrock)
 
-On reroute passes (pass 2 and later), runs started with `agent=1` ask Claude Haiku 5.5 on Amazon Bedrock which offer to make next. The model sees the customer's record, a note from their earlier call, and the offers they already turned down. It picks from the offers still allowed and gives a one-line reason, which is shown in each record's detail. The first offer always comes from the rules engine.
-
-- **Same safety rules as the rest of the system.** The pick must be one of the allowed offers. An error, a timeout (about 6s), throttling or an invalid pick falls back to the rules order for that pass and is counted. A slow or unavailable model never stalls a record, and the pass still commits under its fencing token.
-- **No extra writes.** Token counts ride on the pass's history entry, and run totals are summed when the run is scored.
-- **Comparison in the UI.** "Load test: rules" and "Load test: agent" run the same 1,000 generated customers. Each customer accepts only one offer, and about 70% hinted at it in their note. The panel compares average passes, the share closed on the first reroute, the human-review rate, time to close, model calls, fallbacks and cost. The customers, notes and preferences are synthetic.
-- **Cost:** about 400 input and 40 output tokens per call at $0.10 / $0.50 per million tokens, so about $0.00006 a call and roughly 5–10 cents per 1,000-record agent run. This is the only part of the demo outside the free tier.
-- **Live so far:** the first live comparison ran while Bedrock was still verifying the new account, so all 1,593 model calls were denied and fell back to the rules order. Both 1,000-record arms still closed every record, with 0 lost and 0 double results, which is the fallback path working as designed. The comparison will be re-run once model access is granted.
-- **Production version:** customer history from the customer DB, DynamoDB vector search over past cases with similar concerns (on-demand table), a per-customer A/B split, and a golden-set eval of the model's picks.
+On reroute passes, runs started with `agent=1` ask Claude Haiku 4.5 on Amazon Bedrock which offer to make next. The pick is validated against the allowed offers. Any error, timeout, throttle or invalid pick falls back to the rules order, so the agent never stalls a record and never weakens the fencing or exactly-once guarantees. The architecture, demo scenario, cost and production plan are in [agentic_rebooking.md](agentic_rebooking.md).
 
 ## Production-level enhancements (not in the demo because they cost money)
 

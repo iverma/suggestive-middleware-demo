@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>IROPS re-booking desk</title>
+<title>Storm re-booking desk</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=Barlow+Condensed:wght@500;600;700&display=swap" rel="stylesheet">
 <style>
@@ -34,7 +34,13 @@
   .sub { color: var(--muted); margin: 4px 0 0; max-width: 70ch; }
   header { display: flex; flex-wrap: wrap; gap: 16px 32px; justify-content: space-between; align-items: end;
            padding-bottom: 18px; border-bottom: 2px solid var(--ink); }
-  form.controls { display: flex; flex-wrap: wrap; gap: 10px; align-items: end; }
+  .launch { display: flex; flex-wrap: wrap; gap: 14px; align-items: stretch; margin-top: 14px; }
+  .launch .group { border: 1px solid var(--line); border-radius: 6px; padding: 10px 12px; }
+  .launch .group.tools { border: none; padding-left: 0; margin-left: auto; }
+  .launch h3 { margin: 0 0 8px; font-size: .95rem; }
+  .launch .hint { color: var(--muted); font-weight: 400; font-size: .82rem; margin-left: 6px; }
+  .launch .row { display: flex; flex-wrap: wrap; gap: 10px; align-items: end; }
+  h1 .airport { font-size: .5em; font-weight: 500; color: var(--muted); margin-left: 8px; letter-spacing: 0; }
   label { display: grid; gap: 2px; font-size: .85rem; color: var(--muted); }
   input[type=number] { width: 84px; padding: 7px 8px; border: 1px solid var(--line); border-radius: 4px;
                        background: var(--panel); color: var(--ink); font: inherit; }
@@ -161,23 +167,41 @@
 <div class="wrap">
   <header>
     <div>
-      <h1>MSP re-booking desk</h1>
-      <p class="sub">Winter-storm cancellations, re-booked by workers that scale with the queue. Crash a share of them at any step: every record should still end accepted or with a person, none lost. Several runs can go at once, from any tab; each works on its own copy of the records.</p>
+      <h1>Storm re-booking desk <span class="airport">Minneapolis–Saint Paul (MSP)</span></h1>
+      <p class="sub">A winter storm has cancelled flights out of Minneapolis–Saint Paul, and every affected customer needs a new plan. Workers scale up with the queue. Each customer gets an offer: the rules engine's first choice, then reroutes if they say no. Every record must end with an accepted offer or with a person: none lost and none decided twice, even while workers crash, messages arrive twice and AWS throttles calls. Several runs can share the system at once, from any tab, and each works on its own copy of the records.</p>
     </div>
-    <form class="controls" id="controls">
-      <label>Reject % <input type="number" id="reject" min="0" max="100" value="50"></label>
-      <label>Crash % <input type="number" id="kill" min="0" max="50" value="0"></label>
-      <label>Slow % <input type="number" id="slow" min="0" max="20" value="0"></label>
-      <label>Duplicate % <input type="number" id="dup" min="0" max="100" value="0"></label>
-      <label>Poison % <input type="number" id="poison" min="0" max="10" value="0"></label>
-      <label>Throttle % <input type="number" id="throttle" min="0" max="30" value="0"></label>
-      <button type="submit" class="primary" id="btn-run">Start run</button>
-      <button type="button" id="btn-cancel" hidden>Cancel this run</button>
-      <button type="button" id="btn-load-rules" title="1,000 generated customers who each want one particular offer; reroutes walk the rules engine's order">Load test: rules</button>
-      <button type="button" id="btn-load-agent" title="Same 1,000 customers; each reroute asks Claude Haiku on Bedrock which offer to make next (about 5-10 cents a run)">Load test: agent</button>
-      <button type="button" id="btn-load">Load records</button>
-      <button type="button" id="btn-reset">Reset everything</button>
-    </form>
+    <div class="launch">
+      <form class="group" id="controls" aria-labelledby="g-chaos">
+        <h3 id="g-chaos">Chaos test <span class="hint">100 customer records, faults you choose</span></h3>
+        <div class="row">
+          <label>Reject % <input type="number" id="reject" min="0" max="100" value="50"></label>
+          <label>Crash % <input type="number" id="kill" min="0" max="50" value="0"></label>
+          <label>Slow % <input type="number" id="slow" min="0" max="20" value="0"></label>
+          <label>Duplicate % <input type="number" id="dup" min="0" max="100" value="0"></label>
+          <label>Poison % <input type="number" id="poison" min="0" max="10" value="0"></label>
+          <label>Throttle % <input type="number" id="throttle" min="0" max="30" value="0"></label>
+          <button type="submit" class="primary" id="btn-run">Run chaos</button>
+        </div>
+      </form>
+      <div class="group" aria-labelledby="g-ab">
+        <h3 id="g-ab">Rules vs agent <span class="hint">500 customers each, start both to compare</span></h3>
+        <div class="row">
+          <button type="button" id="btn-load-rules" title="500 generated customers who each want one particular offer; reroutes follow the rules engine's order">Run rules</button>
+          <button type="button" id="btn-load-agent" title="The same 500 customers; each reroute asks Claude Haiku on Bedrock which offer to make next (about 30–50 cents of model calls a run)">Run agent</button>
+        </div>
+      </div>
+      <div class="group" aria-labelledby="g-load">
+        <h3 id="g-load">Load test <span class="hint">1,000 generated customers, no faults</span></h3>
+        <div class="row"><button type="button" id="btn-loadtest">Run load</button></div>
+      </div>
+      <div class="group tools">
+        <h3>&nbsp;</h3>
+        <div class="row">
+          <button type="button" id="btn-cancel" hidden>Cancel this run</button>
+          <button type="button" id="btn-reset">Reset everything</button>
+        </div>
+      </div>
+    </div>
   </header>
   <p id="status" role="status" aria-live="polite"></p>
 
@@ -222,7 +246,7 @@
 
   <section aria-labelledby="ab-h">
     <h2 id="ab-h">Rules vs agent: rerouting with a live model</h2>
-    <p class="section-note">Both load tests use the same 1,000 generated customers. Each customer will only accept one particular offer, and most of them hinted at it on an earlier call (a note on their record). On every reroute the rules arm makes the next offer in the rules engine's fixed order. The agent arm asks Claude Haiku on Bedrock to pick the next offer from what's left, using the record, the note and what was already turned down. The first offer always comes from the rules engine. The note and the hidden preference are synthetic, made for this demo.</p>
+    <p class="section-note">Both arms use the same 500 generated customers and can run side by side. Each customer will only accept one particular offer, and most of them hinted at it on an earlier call (a note on their record). On every reroute the rules arm makes the next offer in the rules engine's fixed order. The agent arm asks Claude Haiku on Bedrock to pick the next offer from what's left, using the record, the note and what was already turned down. The first offer always comes from the rules engine. The note and the hidden preference are synthetic, made for this demo.</p>
     <div class="scroll"><table id="ab-t"></table></div>
   </section>
 
@@ -313,20 +337,26 @@ function view(runId) {
   refresh();
 }
 
-async function call(path, label) {
+async function call(path, label, loadFirst = false) {
   if (busy) return;
   busy = true; document.querySelectorAll("button").forEach(b => b.disabled = true);
   say(`${label}…`);
   try {
+    if (loadFirst) {
+      const l = await fetch("/load?if_missing=1", { method: "POST" });
+      if (!l.ok) throw new Error(`loading customer records: ${(await l.json()).error || l.statusText}`);
+    }
     const r = await fetch(path, { method: "POST" });
     const body = await r.json();
     if (!r.ok) throw new Error(body.error || r.statusText);
     if (path.startsWith("/run")) {
       mine.add(body.run_id); sessionStorageSet("my-runs", JSON.stringify([...mine]));
-      say(`${body.duplicate ? "Already started" : "Started"} ${body.run_id}: ${body.reject_percent}% rejections; ${body.kill_percent}% of worker passes crash, ${body.slow_percent}% run slow, ${body.dup_percent}% are delivered twice, ${body.poison_percent}% are poison, ${body.throttle_percent}% of AWS calls are throttled. Workers ${body.workers}.`);
+      const what = body.kind === "load"
+        ? (body.customer === "preference" ? `${body.records} customers with a preference, ${Number(body.agent) ? "agent" : "rules"} reroutes` : `${body.records} generated customers, no faults`)
+        : `${body.reject_percent}% rejections; ${body.kill_percent}% of worker passes crash, ${body.slow_percent}% run slow, ${body.dup_percent}% are delivered twice, ${body.poison_percent}% are poison, ${body.throttle_percent}% of AWS calls are throttled`;
+      say(`${body.duplicate ? "Already started" : "Started"} ${body.run_id}: ${what}. Workers ${body.workers}.`);
       viewing = body.run_id; view(body.run_id);
-    } else if (path === "/load") say(`Loaded ${body.loaded} records into customer-records-db in ${body.seconds}s.`);
-    else if (path.startsWith("/cancel")) say(`Cancelled ${body.run_id}. Other runs carry on.`);
+    } else if (path.startsWith("/cancel")) say(`Cancelled ${body.run_id}. Other runs carry on.`);
     else say(`Reset everything: cancelled ${body.cancelled_runs.length} runs, deleted ${body.deleted_run_items} run items, emptied the queues. Customer records kept.`);
   } catch (e) { say(`${label} failed: ${e.message}`, true); }
   finally { busy = false; document.querySelectorAll("button").forEach(b => b.disabled = false); refresh(); }
@@ -334,17 +364,16 @@ async function call(path, label) {
 
 $("controls").addEventListener("submit", (e) => {
   e.preventDefault();
-  const q = new URLSearchParams({ reject_percent: $("reject").value, kill_percent: $("kill").value,
-                                 slow_percent: $("slow").value, dup_percent: $("dup").value,
-                                 poison_percent: $("poison").value, throttle_percent: $("throttle").value,
-                                 kind: "chaos", client_token: crypto.randomUUID() });   // one token per click
-  call(`/run?${q}`, "Starting run");
+  startRun({ reject_percent: $("reject").value, kill_percent: $("kill").value, slow_percent: $("slow").value,
+             dup_percent: $("dup").value, poison_percent: $("poison").value, throttle_percent: $("throttle").value,
+             kind: "chaos" }, "Starting the chaos run");             // one client token per click
 });
-$("btn-load").onclick = () => call("/load", "Loading records");
-const loadTest = (agent) => call(`/run?${new URLSearchParams({ kind: "load", records: 1000, customer: "preference", agent,
-  client_token: crypto.randomUUID() })}`, agent ? "Starting agent load test" : "Starting rules load test");
-$("btn-load-rules").onclick = () => loadTest(0);
-$("btn-load-agent").onclick = () => loadTest(1);
+// Every Run button loads the customer records first (a no-op when they're already there).
+const startRun = (params, label) => call(`/run?${new URLSearchParams({ ...params, client_token: crypto.randomUUID() })}`, label, true);
+const armRun = (agent) => startRun({ kind: "load", records: 500, customer: "preference", agent }, agent ? "Starting the agent arm" : "Starting the rules arm");
+$("btn-load-rules").onclick = () => armRun(0);
+$("btn-load-agent").onclick = () => armRun(1);
+$("btn-loadtest").onclick = () => startRun({ kind: "load", records: 1000 }, "Starting the load test");
 $("btn-cancel").onclick = () => { if (viewing && confirm(`Cancel ${viewing}? Other runs are not affected.`)) call(`/cancel?run=${encodeURIComponent(viewing)}`, "Cancelling"); };
 $("btn-reset").onclick = () => { if (confirm("Cancel EVERY run for everyone, empty the queues and delete all run data? Customer records are kept.")) call("/reset?confirm=everything", "Resetting everything"); };
 
@@ -475,7 +504,7 @@ function renderDetail() {
 // --- run box -------------------------------------------------------------------
 function renderRunbox(run, maps) {
   const maxWorkers = Object.values(maps || {}).reduce((a, m) => a + m.max_workers, 0);
-  if (!run) { $("runbox").innerHTML = `<h2>No runs yet</h2><p class="empty-note">Load records, then start a run. Workers scale up to ${maxWorkers} as the queues fill.</p>`; return; }
+  if (!run) { $("runbox").innerHTML = `<h2>No runs yet</h2><p class="empty-note">Pick a run above. Workers scale up to ${maxWorkers} as the queues fill.</p>`; return; }
   const s = run.stats;
   const notes = [];
   if (s.queued_s != null) notes.push(`All ${s.records} records queued at ${s.queued_s}s`);
@@ -729,8 +758,16 @@ async function refresh() {
   try {
     const sent = Date.now();
     const r = await fetch(viewing ? `/results?run=${encodeURIComponent(viewing)}` : "/results", { cache: "no-store" });
-    data = await r.json();
-    if (!r.ok) throw new Error(data.error || r.statusText);
+    if (r.status === 429 || r.status === 503) {
+      // Every Lambda in the account is busy (workers and producers at full scale): keep showing
+      // the last view and try again shortly. Nothing is lost; this page just waits its turn.
+      $("status").textContent = "Busy: all Lambda capacity is in use, retrying in a few seconds…";
+      timer = setTimeout(refresh, 3000 + Math.random() * 2000);
+      return;
+    }
+    const fresh = await r.json();
+    if (!r.ok) throw new Error(fresh.error || r.statusText);
+    data = fresh;
     clockOffset = data.generated_at * 1000 - (sent + Date.now()) / 2;   // server clock vs this browser
     const run = data.latest_run;
     renderActive(data);
@@ -748,7 +785,7 @@ async function refresh() {
       renderChart(run, data.worker_mappings); renderPasses(run); renderQueues(data.queues, data.worker_mappings);
       renderWorkers(run); renderFeed(run); renderDegradation(run); renderCrashes(run); renderRaces(run); renderRuns(data.recent_runs || []); renderRecords(run); renderDetail(); tick();
     }
-    if (!run && !busy) say(data.records_in_table ? `${data.records_in_table} records loaded. Start a run.` : "No records loaded. Load records to begin.");
+    if (!run && !busy) say("Pick a run above: chaos, rules vs agent, or load.");
   } catch (e) { say(`Couldn't read results: ${e.message}`, true); }
   const live = data && ((data.latest_run && ACTIVE.includes(data.latest_run.status)) || (data.active_runs || []).length);
   timer = setTimeout(refresh, live ? 2000 : 10000);

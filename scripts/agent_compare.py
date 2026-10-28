@@ -1,7 +1,7 @@
 """
 Live rules-vs-agent comparison against the deployed demo: the same generated customers (each
-wants one particular offer), first with agent reroutes (Claude Haiku on Bedrock), then with
-the rules engine's order. Prints both summaries side by side as annotations.
+wants one particular offer), with agent reroutes (Claude Haiku on Bedrock) and with the rules
+engine's order, run side by side as two tenants. Prints both summaries as annotations.
 
     python3 scripts/agent_compare.py https://<id>.lambda-url.<region>.on.aws/ [records]
 """
@@ -22,40 +22,48 @@ def call(base, method, path):
         return e.code, json.loads(e.read() or b"{}")
 
 
-def run_arm(base, agent, records, timeout_s=2400):
+def start_arm(base, agent, records, timeout_s=1200):
     end = time.time() + timeout_s
     while True:                                 # wait for room in the shared budget
         status, body = call(base, "POST", f"/run?kind=load&customer=preference&agent={agent}&records={records}"
                                           f"&client_token={uuid.uuid4()}")
         if status == 202:
-            break
+            print(f"arm agent={agent}: {body['run_id']} at {body.get('rate')} records/s")
+            return body["run_id"]
         if status != 429 or time.time() > end:
             raise SystemExit(f"::error::arm agent={agent} not admitted: {status} {body}")
         print("waiting for budget room:", body)
         time.sleep(20)
-    run_id = body["run_id"]
-    print(f"arm agent={agent}: {run_id} at {body.get('rate')} records/s")
-    while time.time() < end:
+
+
+def wait_arms(base, runs, timeout_s=2400):
+    end, done = time.time() + timeout_s, {}
+    while time.time() < end and len(done) < len(runs):
         time.sleep(20)
-        _, res = call(base, "GET", f"/results?run={run_id}")
-        lr = res.get("latest_run") or {}
-        s = lr.get("stats", {})
-        print(f"  {lr.get('status')}: released {s.get('released')} closed {s.get('closed')}/{s.get('records')} "
-              f"at {s.get('duration_s')}s")
-        if lr.get("summary"):
-            return run_id, lr["summary"]
-        if lr.get("status") in ("failed", "cancelled"):
-            raise SystemExit(f"::error::{run_id} {lr.get('status')}: {lr.get('error')}")
-    raise SystemExit(f"::error::{run_id} did not finish in time")
+        for agent, run_id in runs.items():
+            if agent in done:
+                continue
+            status, res = call(base, "GET", f"/results?run={run_id}")
+            if status != 200:
+                continue                        # busy (429): try again next round
+            lr = res.get("latest_run") or {}
+            s = lr.get("stats", {})
+            print(f"  agent={agent} {lr.get('status')}: released {s.get('released')} closed {s.get('closed')}/"
+                  f"{s.get('records')} at {s.get('duration_s')}s")
+            if lr.get("summary"):
+                done[agent] = lr["summary"]
+            elif lr.get("status") in ("failed", "cancelled"):
+                raise SystemExit(f"::error::{run_id} {lr.get('status')}: {lr.get('error')}")
+    if len(done) < len(runs):
+        raise SystemExit("::error::arms did not finish in time")
+    return done
 
 
-def main(base, records="1000"):
-    out = {}
-    for agent in (1, 0):
-        run_id, s = run_arm(base, agent, int(records))
-        out[agent] = s
-        name = "agent" if agent else "rules"
-        print(f"::notice title={name} arm {run_id}::{json.dumps(s)}")
+def main(base, records="500"):
+    runs = {agent: start_arm(base, agent, int(records)) for agent in (1, 0)}     # side by side
+    out = wait_arms(base, runs)
+    for agent, s in out.items():
+        print(f"::notice title={'agent' if agent else 'rules'} arm {runs[agent]}::{json.dumps(s)}")
     a, r = out[1], out[0]
     first = lambda s: f"{round(100 * s['closed_first_reroute'] / max(1, s['rerouted']))}%"
     print(f"::notice title=Rules vs agent::avg passes {r['avg_passes']} vs {a['avg_passes']}; closed on first reroute "

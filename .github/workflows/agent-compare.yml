@@ -1,11 +1,11 @@
 name: Agent compare
 
-# Live rules-vs-agent comparison (Claude Haiku on Bedrock for reroutes). Not free: about
-# 5-10 cents of model calls per 1,000-record agent run. Run by hand only.
+# Live rules-vs-agent comparison, both arms side by side (Claude Haiku 4.5 on Bedrock for the
+# agent's reroutes). Not free: about 50 cents of model calls per 500-record agent arm. By hand only.
 on:
   workflow_dispatch:
     inputs:
-      records: { description: "Records per arm", default: "1000" }
+      records: { description: "Records per arm", default: "500" }
 
 permissions:
   contents: read
@@ -23,5 +23,5 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
-      - name: Agent arm, then rules arm, same customers
-        run: python3 scripts/agent_compare.py "$DEMO_URL" "${{ inputs.records || '1000' }}"
+      - name: Agent and rules arms side by side, same customers
+        run: python3 scripts/agent_compare.py "$DEMO_URL" "${{ inputs.records || '500' }}"

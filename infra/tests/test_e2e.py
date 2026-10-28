@@ -951,3 +951,11 @@ def test_agent_failure_falls_back_to_rules_order(env, monkeypatch):
     s = wait_summary(handler, run_id)["summary"]
     assert s["passed"] and s["closed"] == 40
     assert s["agent_calls"] == s["agent_fallbacks"] > 0
+
+
+def test_load_if_missing_is_a_no_op_once_loaded(env):
+    handler, *_ = env
+    status, body = http(handler, "POST", "/load", if_missing=1)
+    assert status == 200 and body["loaded"] == 100
+    status, body = http(handler, "POST", "/load", if_missing=1)
+    assert status == 200 and body["loaded"] == 0 and body["already_loaded"] == 100

@@ -70,9 +70,9 @@ VISIBILITY_SECONDS = 20
 # Autoscaling ceiling, per queue. The account's Lambda concurrency limit is 10 (new-account
 # default) and is shared by every function, so workers get 8 and the UI/API keeps 2.
 # After a quota increase, raise these: e.g. 20 and 10.
-AGENT_MODEL_ID = "global.anthropic.claude-haiku-5-5"   # cheapest Claude on Bedrock ($0.10/$0.50 per M tokens)
+AGENT_MODEL_ID = "global.anthropic.claude-haiku-4-5-20251001-v1:0"   # Claude Haiku 4.5 ($1/$5 per M tokens)
 LAMBDA_ACCOUNT_CONCURRENCY = 10   # this account's quota (see the AWS limits workflow)
-REBOOKING_MAX_WORKERS = 5
+REBOOKING_MAX_WORKERS = 3
 REROUTING_MAX_WORKERS = 3
 CONTROL_FN = "effect-demo-experiment-control"
 LOAD_SCHEMA_VERSION = "2: inputs only; run fields live on each run's copy"
@@ -165,7 +165,7 @@ class CustomerRecordsStack(Stack):
                     "Re-booking worker: invoked by SQS, claims records with fencing tokens",
                     {**env, "ROLE": "worker", "AGENT_MODEL_ID": AGENT_MODEL_ID})
         # Reroute agent (runs started with agent=1): one Claude Haiku call per reroute pass, via the
-        # global cross-region inference profile. Not free tier: about $0.00006 a call.
+        # global cross-region inference profile. Not free tier: about $0.0006 a call.
         worker.add_to_role_policy(iam.PolicyStatement(
             actions=["bedrock:InvokeModel"],
             resources=[f"arn:{self.partition}:bedrock:{self.region}:{self.account}:inference-profile/{AGENT_MODEL_ID}",

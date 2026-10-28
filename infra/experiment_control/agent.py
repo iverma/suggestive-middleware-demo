@@ -7,8 +7,9 @@ in one line. The pick must be one of the allowed offers; anything else (an error
 an unknown offer, unparseable output) returns None and the worker falls back to the rules
 engine's order for that pass, so a slow or failing model never stalls a record.
 
-Cost: about 400 input and 40 output tokens per call. Claude Haiku 5.5 via the global
-inference profile is $0.10 / $0.50 per million tokens, so about $0.00006 a call.
+Cost: about 400 input and 40 output tokens per call. Claude Haiku 4.5 via the global
+inference profile is $1 / $5 per million tokens, so about $0.0006 a call. (Haiku 5.5 is ten
+times cheaper but isn't available to this account.)
 """
 import json
 import os
@@ -17,8 +18,8 @@ import re
 import boto3
 from botocore.config import Config
 
-MODEL_ID = os.environ.get("AGENT_MODEL_ID", "global.anthropic.claude-haiku-5-5")
-PRICE_IN, PRICE_OUT = 0.10, 0.50              # USD per million tokens (global profile)
+MODEL_ID = os.environ.get("AGENT_MODEL_ID", "global.anthropic.claude-haiku-4-5-20251001-v1:0")
+PRICE_IN, PRICE_OUT = 1.00, 5.00              # USD per million tokens, Claude Haiku 4.5 (global profile)
 _client = None
 
 OFFER_TEXT = {
