@@ -41,3 +41,25 @@ jobs:
           echo "::notice title=Haiku inference profiles::$P"
           M=$(aws bedrock list-foundation-models --by-provider anthropic --query "modelSummaries[?contains(modelId, 'haiku')].[modelId,modelLifecycle.status,join('/',inferenceTypesSupported)]" --output text 2>&1 | tr '\t\n' ' ,')
           echo "::notice title=Haiku foundation models::$M"
+      - name: Recent agent fallback errors from the worker logs (read-only)
+        run: |
+          ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+          CREDS=$(aws sts assume-role --role-arn "arn:aws:iam::${ACCOUNT}:role/cdk-hnb659fds-lookup-role-${ACCOUNT}-${AWS_REGION}" \
+                  --role-session-name logs --query Credentials --output json)
+          export AWS_ACCESS_KEY_ID=$(echo "$CREDS" | jq -r .AccessKeyId)
+          export AWS_SECRET_ACCESS_KEY=$(echo "$CREDS" | jq -r .SecretAccessKey)
+          export AWS_SESSION_TOKEN=$(echo "$CREDS" | jq -r .SessionToken)
+          START=$(( ($(date +%s) - 3*3600) * 1000 ))
+          aws logs filter-log-events --log-group-name /aws/lambda/effect-demo-worker --start-time $START \
+            --filter-pattern '"agent_fallback"' --max-items 400 --query 'events[].message' --output json 2>&1 \
+            | python3 -c "
+          import json, sys, collections
+          raw = sys.stdin.read()
+          try:
+              msgs = json.loads(raw)
+          except ValueError:
+              print('::notice title=Agent errors::' + raw[:500]); sys.exit()
+          c = collections.Counter(json.loads(m).get('error', '')[:300] for m in msgs if m.strip().startswith('{'))
+          for err, n in c.most_common(4):
+              print(f'::notice title=Agent error x{n}::{err}')
+          "
