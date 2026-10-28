@@ -63,3 +63,29 @@ jobs:
           for err, n in c.most_common(4):
               print(f'::notice title=Agent error x{n}::{err}')
           "
+      - name: experiment-runs write capacity during the last rules/agent comparison (read-only)
+        run: |
+          ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+          CREDS=$(aws sts assume-role --role-arn "arn:aws:iam::${ACCOUNT}:role/cdk-hnb659fds-lookup-role-${ACCOUNT}-${AWS_REGION}" \
+                  --role-session-name cw --query Credentials --output json)
+          export AWS_ACCESS_KEY_ID=$(echo "$CREDS" | jq -r .AccessKeyId)
+          export AWS_SECRET_ACCESS_KEY=$(echo "$CREDS" | jq -r .SecretAccessKey)
+          export AWS_SESSION_TOKEN=$(echo "$CREDS" | jq -r .SessionToken)
+          for W in "2026-10-28T14:53:00Z 2026-10-28T15:12:00Z agent-arm" "2026-10-28T15:12:30Z 2026-10-28T15:32:00Z rules-arm"; do
+            set -- $W
+            P=$(aws cloudwatch get-metric-statistics --namespace AWS/DynamoDB --metric-name ConsumedWriteCapacityUnits \
+                --dimensions Name=TableName,Value=experiment-runs --start-time $1 --end-time $2 --period 60 --statistics Sum \
+                --query 'Datapoints[].Sum' --output json | python3 -c "import json,sys; d=json.load(sys.stdin); print(f'peak {max(d)/60:.1f} WCU/s, mean {sum(d)/len(d)/60:.1f} WCU/s, total {sum(d):.0f} WCU over {len(d)} min')")
+            A=$(aws cloudwatch describe-alarm-history --alarm-name effect-demo-runs-table-write-capacity --start-date $1 --end-date $2 --history-item-type StateUpdate --query 'AlarmHistoryItems[].HistorySummary' --output text 2>&1 | head -c 300)
+            echo "::notice title=WCU $3::$P alarm: $A"
+          done
+          T=$(aws cloudwatch get-metric-statistics --namespace AWS/Lambda --metric-name Throttles \
+              --dimensions Name=FunctionName,Value=effect-demo-experiment-control --start-time $(date -u -d '-24 hours' +%FT%TZ) \
+              --end-time $(date -u +%FT%TZ) --period 3600 --statistics Sum --query 'sum(Datapoints[].Sum)' --output text 2>&1)
+          W=$(aws cloudwatch get-metric-statistics --namespace AWS/Lambda --metric-name Throttles \
+              --dimensions Name=FunctionName,Value=effect-demo-worker --start-time $(date -u -d '-24 hours' +%FT%TZ) \
+              --end-time $(date -u +%FT%TZ) --period 3600 --statistics Sum --query 'sum(Datapoints[].Sum)' --output text 2>&1)
+          C=$(aws cloudwatch get-metric-statistics --namespace AWS/Lambda --metric-name ConcurrentExecutions \
+              --start-time $(date -u -d '-24 hours' +%FT%TZ) --end-time $(date -u +%FT%TZ) --period 3600 --statistics Maximum \
+              --query 'max(Datapoints[].Maximum)' --output text 2>&1)
+          echo "::notice title=Lambda throttles (24h)::control function $T, worker $W, account peak concurrency $C"
