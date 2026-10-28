@@ -567,7 +567,7 @@ def test_twenty_simultaneous_starts_admit_exactly_the_budget(env):
     refused = [b for s, b in results if s == 429]
     n = handler.MAX_ACTIVE_RUNS
     assert n > 2 and len(accepted) == n and len(refused) == 20 - n
-    assert "budget is full" in refused[0]["error"]
+    assert "not enough room" in refused[0]["error"]
     _, res = http(handler, "GET", "/results")
     assert sorted(r["run_id"] for r in res["recent_runs"]) == sorted(accepted)   # no orphans
     for run_id in accepted:
@@ -583,7 +583,7 @@ def test_record_budget_is_shared_across_run_kinds(env, monkeypatch):
     start(handler, kind="chaos")
     start(handler, kind="integration")
     status, body = http(handler, "POST", "/run", kind="chaos")
-    assert status == 429 and "200 of 250 records" in body["error"]
+    assert status == 429 and "200 of 250 are in use" in body["error"]
 
 
 def test_cancelling_one_run_leaves_the_other_running(env):
@@ -959,3 +959,18 @@ def test_load_if_missing_is_a_no_op_once_loaded(env):
     assert status == 200 and body["loaded"] == 100
     status, body = http(handler, "POST", "/load", if_missing=1)
     assert status == 200 and body["loaded"] == 0 and body["already_loaded"] == 100
+
+
+def test_housekeeping_corrects_a_drifted_record_budget(env):
+    """Found live: the admitted-record counter drifted 1,000 high with no run holding it."""
+    handler, common, *_ = env
+    common.ddb.update_item(TableName="experiment-runs", Key=common.to_ddb(handler.ADMISSION_KEY),
+                           UpdateExpression="ADD active_records :n", ExpressionAttributeValues=common.to_ddb({":n": 1000}))
+    assert handler.admission()["records"] == 1000
+    out = handler.housekeeping()
+    assert out["actions"]["budget"] == "record count corrected by -1000"
+    assert handler.admission()["records"] == 0
+    http(handler, "POST", "/load")
+    run_id = start(handler, reject_percent=0)       # admitted again
+    assert handler.admission()["records"] == 100
+    wait_complete(handler, run_id)

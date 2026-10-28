@@ -66,7 +66,7 @@ How it's tested: the mocked suite covers 20 simultaneous starts, budget limits, 
 | **Retries with backoff** (botocore standard mode; message-level backoff on throttles) | DynamoDB/SQS throttling and transient errors. |
 | **Dead-letter queue + sweeper** | Poison messages: after 5 deliveries the record goes to human review with a fenced write, in its own run's partition. |
 | **Lost-handoff repair and orphan re-queue** | A record whose next message never got sent, or disappeared. A record whose message is in the dead-letter queue is left to the sweeper, so poison is never quietly re-sent. That gap was found live. |
-| **Housekeeping** | Runs stuck starting, runs past their time limit, budget held by finished runs, dead load producers, worker mappings out of step. |
+| **Housekeeping** | Runs stuck starting, runs past their time limit, budget held by finished runs, dead load producers, worker mappings out of step, and a drifted record budget. The admitted-record counter is recounted from the runs actually active and corrected (found live: it drifted 1,000 high and refused new runs). |
 | **Alarms (CloudWatch → email)** | Backlog, message age, DLQ depth, DynamoDB capacity and throttles, Lambda errors, and a stuck-run heartbeat. |
 | **Backups** | None in the demo. Point-in-time recovery isn't in the free tier (see production-level enhancements). |
 

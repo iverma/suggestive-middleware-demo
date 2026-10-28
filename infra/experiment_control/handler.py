@@ -295,8 +295,14 @@ def admit(meta, index, client_token=None):
             return prior.get("run_id"), "duplicate"
         if reasons and reasons[0] == "ConditionalCheckFailed":
             adm = admission()
-            return None, (f"the shared run budget is full: {len(adm['active'])} of {MAX_ACTIVE_RUNS} runs and "
-                          f"{adm['records']} of {RECORD_BUDGET} records in flight; try again when one finishes")
+            holders = []
+            for r in sorted(adm["active"]):
+                m = get_meta(r) or {}
+                arm = {"1": " agent arm", "0": " rules arm"}.get(str(m.get("agent")), "") if m.get("customer") == "preference" else ""
+                holders.append(f"{m.get('kind', 'run')}{arm} …{r[-6:]} ({m.get('records', '?')})")
+            return None, (f"not enough room: this run needs {meta['records']:,} records, and {adm['records']:,} of "
+                          f"{RECORD_BUDGET:,} are in use ({len(adm['active'])} of {MAX_ACTIVE_RUNS} runs"
+                          f"{': ' + ', '.join(holders) if holders else ''}). Try again when one finishes, or cancel one")
         raise
 
 
@@ -1135,6 +1141,29 @@ def requeue_orphans(run_id, rows, queues, t):
 
 
 # --- housekeeping --------------------------------------------------------------
+def reconcile_budget():
+    """
+    The admitted-record counter is kept with ADD/subtract in the same transactions that admit and
+    finish runs. Found live: it drifted 1,000 records high with no run holding them, which
+    blocked new runs. Recompute it from the runs actually in the active set, and write it only if
+    no admission or finish happened in between (epoch unchanged). Returns the correction.
+    """
+    adm = admission()
+    actual = sum(int(m.get("records", 0)) for m in (get_meta(r, consistent=True) for r in adm["active"])
+                 if m and m.get("status") in ACTIVE)
+    if actual == adm["records"]:
+        return 0
+    try:
+        ddb.update_item(TableName=RUNS_TABLE, Key=to_ddb(ADMISSION_KEY),
+                        UpdateExpression="SET active_records = :n ADD epoch :one",
+                        ConditionExpression="epoch = :e OR (attribute_not_exists(epoch) AND :e = :zero)",
+                        ExpressionAttributeValues=to_ddb({":n": actual, ":e": adm["epoch"], ":one": 1, ":zero": 0}))
+    except ddb.exceptions.ConditionalCheckFailedException:
+        return 0                                # something changed meanwhile; the next tick checks again
+    print(dumps({"budget_reconciled": {"was": adm["records"], "now": actual, "active": sorted(adm["active"])}}))
+    return actual - adm["records"]
+
+
 def housekeeping():
     """Every few minutes: finish or fail unwatched runs, free their budget, reconcile workers."""
     try:
@@ -1183,6 +1212,9 @@ def _housekeeping():
                 n = requeue_orphans(run_id, open_rows, queue_depths(), t)
                 if n:
                     actions[run_id] = f"requeued {n} orphans"
+    drift = reconcile_budget()
+    if drift:
+        actions["budget"] = f"record count corrected by {drift:+d}"
     mappings = safe_reconcile()
     # Custom metric for the stuck-run alarm, via CloudWatch embedded metric format (a log line,
     # no API call): seconds since any active run last closed a record. 0 when nothing is active.

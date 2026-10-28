@@ -204,6 +204,7 @@
     </div>
   </header>
   <p id="status" role="status" aria-live="polite"></p>
+  <p id="busy-note" class="section-note" hidden></p>
 
   <section class="active-runs" aria-label="Runs in progress">
     <div class="budget" id="budget"></div>
@@ -337,18 +338,28 @@ function view(runId) {
   refresh();
 }
 
+// POST, retrying while Lambda itself is throttling (its 429 has no "error" field); the API's own
+// errors (a full run budget is also a 429) come back at once with an explanation.
+async function post(path) {
+  for (let attempt = 0; ; attempt++) {
+    const r = await fetch(path, { method: "POST" });
+    let body = {};
+    try { body = await r.json(); } catch (_) {}
+    const lambdaBusy = (r.status === 429 || r.status === 503) && !body.error;
+    if (lambdaBusy && attempt < 5) { await new Promise(res => setTimeout(res, 1500 * (attempt + 1))); continue; }
+    if (lambdaBusy) throw new Error("all of the account's Lambda capacity is busy; try again in a minute");
+    if (!r.ok) throw new Error(body.error || r.statusText);
+    return body;
+  }
+}
+
 async function call(path, label, loadFirst = false) {
-  if (busy) return;
+  if (busy) { say("Still working on the previous click…"); return; }
   busy = true; document.querySelectorAll("button").forEach(b => b.disabled = true);
   say(`${label}…`);
   try {
-    if (loadFirst) {
-      const l = await fetch("/load?if_missing=1", { method: "POST" });
-      if (!l.ok) throw new Error(`loading customer records: ${(await l.json()).error || l.statusText}`);
-    }
-    const r = await fetch(path, { method: "POST" });
-    const body = await r.json();
-    if (!r.ok) throw new Error(body.error || r.statusText);
+    if (loadFirst) await post("/load?if_missing=1");
+    const body = await post(path);
     if (path.startsWith("/run")) {
       mine.add(body.run_id); sessionStorageSet("my-runs", JSON.stringify([...mine]));
       const what = body.kind === "load"
@@ -761,13 +772,14 @@ async function refresh() {
     if (r.status === 429 || r.status === 503) {
       // Every Lambda in the account is busy (workers and producers at full scale): keep showing
       // the last view and try again shortly. Nothing is lost; this page just waits its turn.
-      $("status").textContent = "Busy: all Lambda capacity is in use, retrying in a few seconds…";
+      $("busy-note").hidden = false;
+      $("busy-note").textContent = "All of the account's Lambda capacity is busy right now; this view refreshes again in a few seconds.";
       timer = setTimeout(refresh, 3000 + Math.random() * 2000);
       return;
     }
     const fresh = await r.json();
     if (!r.ok) throw new Error(fresh.error || r.statusText);
-    data = fresh;
+    data = fresh; $("busy-note").hidden = true;
     clockOffset = data.generated_at * 1000 - (sent + Date.now()) / 2;   // server clock vs this browser
     const run = data.latest_run;
     renderActive(data);
@@ -785,7 +797,7 @@ async function refresh() {
       renderChart(run, data.worker_mappings); renderPasses(run); renderQueues(data.queues, data.worker_mappings);
       renderWorkers(run); renderFeed(run); renderDegradation(run); renderCrashes(run); renderRaces(run); renderRuns(data.recent_runs || []); renderRecords(run); renderDetail(); tick();
     }
-    if (!run && !busy) say("Pick a run above: chaos, rules vs agent, or load.");
+    if (!run && !busy && $("status").className !== "err") say("Pick a run above: chaos, rules vs agent, or load.");
   } catch (e) { say(`Couldn't read results: ${e.message}`, true); }
   const live = data && ((data.latest_run && ACTIVE.includes(data.latest_run.status)) || (data.active_runs || []).length);
   timer = setTimeout(refresh, live ? 2000 : 10000);
