@@ -111,3 +111,14 @@ jobs:
           export AWS_SESSION_TOKEN=$(echo "$CREDS" | jq -r .SessionToken)
           I=$(aws dynamodb get-item --table-name experiment-runs --consistent-read --key '{"pk":{"S":"CONTROL"},"sk":{"S":"ADMISSION"}}' --output json 2>&1 | tr -d '\n ' | head -c 600)
           echo "::notice title=Admission item::$I"
+      - name: Bedrock quotas for Claude Haiku 4.5 (read-only)
+        run: |
+          ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+          CREDS=$(aws sts assume-role --role-arn "arn:aws:iam::${ACCOUNT}:role/cdk-hnb659fds-lookup-role-${ACCOUNT}-${AWS_REGION}" \
+                  --role-session-name q --query Credentials --output json)
+          export AWS_ACCESS_KEY_ID=$(echo "$CREDS" | jq -r .AccessKeyId)
+          export AWS_SECRET_ACCESS_KEY=$(echo "$CREDS" | jq -r .SecretAccessKey)
+          export AWS_SESSION_TOKEN=$(echo "$CREDS" | jq -r .SessionToken)
+          aws service-quotas list-service-quotas --service-code bedrock --output json \
+            --query "Quotas[?contains(QuotaName, 'Haiku 4.5')].[QuotaName,Value]" 2>&1 \
+            | python3 -c "import json,sys; [print(f'::notice title=Bedrock quota::{n} = {v}') for n, v in json.load(sys.stdin)]"
