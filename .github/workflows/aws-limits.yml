@@ -29,3 +29,15 @@ jobs:
           export AWS_SESSION_TOKEN=$(echo "$CREDS" | jq -r .SessionToken)
           S=$(aws lambda get-account-settings --query '{limit:AccountLimit.ConcurrentExecutions,unreserved:AccountLimit.UnreservedConcurrentExecutions}' --output text)
           echo "::notice title=Lambda concurrency (limit, unreserved)::$S"
+      - name: Bedrock Claude Haiku models and inference profiles in this region (read-only)
+        run: |
+          ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+          CREDS=$(aws sts assume-role --role-arn "arn:aws:iam::${ACCOUNT}:role/cdk-hnb659fds-lookup-role-${ACCOUNT}-${AWS_REGION}" \
+                  --role-session-name bedrock --query Credentials --output json)
+          export AWS_ACCESS_KEY_ID=$(echo "$CREDS" | jq -r .AccessKeyId)
+          export AWS_SECRET_ACCESS_KEY=$(echo "$CREDS" | jq -r .SecretAccessKey)
+          export AWS_SESSION_TOKEN=$(echo "$CREDS" | jq -r .SessionToken)
+          P=$(aws bedrock list-inference-profiles --query "inferenceProfileSummaries[?contains(inferenceProfileId, 'haiku')].[inferenceProfileId,status]" --output text 2>&1 | tr '\t\n' ' ,')
+          echo "::notice title=Haiku inference profiles::$P"
+          M=$(aws bedrock list-foundation-models --by-provider anthropic --query "modelSummaries[?contains(modelId, 'haiku')].[modelId,modelLifecycle.status,join('/',inferenceTypesSupported)]" --output text 2>&1 | tr '\t\n' ' ,')
+          echo "::notice title=Haiku foundation models::$M"
