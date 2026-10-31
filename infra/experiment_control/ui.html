@@ -192,7 +192,10 @@
       </div>
       <div class="group" aria-labelledby="g-load">
         <h3 id="g-load">Load test <span class="hint">1,000 generated customers, no faults</span></h3>
-        <div class="row"><button type="button" id="btn-loadtest">Run load</button></div>
+        <div class="row">
+          <button type="button" id="btn-loadtest" title="Releases records at a steady rate; the backlog cap (500) rarely binds">Run load</button>
+          <button type="button" id="btn-backpressure" title="Same 1,000 customers with a backlog cap of 10: the producer is held back whenever workers fall behind, and hands off to a fresh invocation every minute">Run with backpressure</button>
+        </div>
       </div>
       <div class="group tools">
         <h3>&nbsp;</h3>
@@ -385,6 +388,7 @@ const armRun = (agent) => startRun({ kind: "load", records: 500, customer: "pref
 $("btn-load-rules").onclick = () => armRun(0);
 $("btn-load-agent").onclick = () => armRun(1);
 $("btn-loadtest").onclick = () => startRun({ kind: "load", records: 1000 }, "Starting the load test");
+$("btn-backpressure").onclick = () => startRun({ kind: "load", records: 1000, backlog_cap: 10, chunk_s: 60 }, "Starting the backpressure test");
 $("btn-cancel").onclick = () => { if (viewing && confirm(`Cancel ${viewing}? Other runs are not affected.`)) call(`/cancel?run=${encodeURIComponent(viewing)}`, "Cancelling"); };
 $("btn-reset").onclick = () => { if (confirm("Cancel EVERY run for everyone, empty the queues and delete all run data? Customer records are kept.")) call("/reset?confirm=everything", "Resetting everything"); };
 
